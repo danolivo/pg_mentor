@@ -1,0 +1,2 @@
+CREATE EXTENSION pg_mentor CASCADE;
+NOTICE:  installing required extension "pg_stat_statements"

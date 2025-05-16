@@ -1,0 +1,246 @@
+/*-------------------------------------------------------------------------
+ *
+ * pg_mentor.c
+ *		Attempts to tune query settings based on execution statistics.
+ *
+ * Copyright (c) 2025, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  contrib/pg_mentor/pg_mentor.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#include "postgres.h"
+
+#include "commands/prepare.h"
+#include "nodes/execnodes.h"
+#include "miscadmin.h"
+#include "parser/analyze.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/syscache.h"
+
+#define MODULENAME	"pg_mentor"
+
+PG_MODULE_MAGIC_EXT(
+					.name = MODULENAME,
+					.version = PG_VERSION
+);
+
+PG_FUNCTION_INFO_V1(set_prepared_statement_status);
+
+static const char *psfuncname = "pg_prepared_statement";
+static Oid		   psfuncoid = 0;
+
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+
+typedef struct SharedState
+{
+	pg_atomic_uint64 state_generation;
+} SharedState;
+
+typedef struct MentorTblEntry
+{
+	uint64		queryid;
+	int			plan_cache_mode;
+	TimestampTz	since;
+} MentorTblEntry;
+
+static SharedState *state = NULL;
+static HTAB		   *pgm_hash = NULL;
+
+static int max_records_num = 1024;
+
+static uint64 local_state_generation = 0; /* 0 - not initialised */
+
+Datum
+set_prepared_statement_status(PG_FUNCTION_ARGS)
+{
+	const char		   *stmt_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int					status = PG_GETARG_INT32(1);
+	PreparedStatement  *entry;
+
+	if (status < 0 || status > 2)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("plan cache mode %d is out of valid range", status));
+
+	entry = FetchPreparedStatement(stmt_name, false);
+	if (entry == NULL)
+		PG_RETURN_BOOL(false);
+
+	switch (status)
+	{
+		case 0:
+			/* PLAN_CACHE_MODE_AUTO */
+			entry->plansource->cursor_options &=
+							~(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN);
+			break;
+		case 1:
+			/* PLAN_CACHE_MODE_FORCE_GENERIC_PLAN */
+			entry->plansource->cursor_options &= ~CURSOR_OPT_CUSTOM_PLAN;
+			entry->plansource->cursor_options |= CURSOR_OPT_GENERIC_PLAN;
+			break;
+		case 2:
+			/* PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN */
+			entry->plansource->cursor_options &= ~CURSOR_OPT_GENERIC_PLAN;
+			entry->plansource->cursor_options |= CURSOR_OPT_CUSTOM_PLAN;
+			break;
+		default:
+			Assert(0);
+	}
+
+	PG_RETURN_BOOL(true);
+}
+
+#include "executor/spi.h"
+
+static int
+get_stmt_names(char **names)
+{
+	SPITupleTable	   *spi_tuptable;
+	TupleDesc			spi_tupdesc;
+	HeapTuple			spi_tuple;
+	int64				i;
+	int					ret;
+	uint64				proc;
+
+	SPI_connect();
+	ret = SPI_execute("SELECT * FROM pg_prepared_statement()", true, 0);
+	proc = SPI_processed;
+
+	if (ret != SPI_OK_SELECT || proc == 0)
+	{
+		SPI_finish();
+		return 0;
+	}
+
+	spi_tuptable = SPI_tuptable;
+	spi_tupdesc = spi_tuptable->tupdesc;
+
+	*names = palloc(proc * sizeof(char *));
+	for (i = 0; i < proc; i++)
+	{
+		spi_tuple = spi_tuptable->vals[i];
+		names[i] = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
+	}
+
+	return proc;
+}
+
+/*
+ * Does prepared statements table changed?
+ *
+ * Prepared statement should be revalidated before deciding on building a plan.
+ * At this moment any shift in management table may be detected and new plan
+ * options applied.
+ *
+ * XXX: it seems not ideal solution due to slow down in arbitrary query
+ * planning. Is this an architectural defect of Postgres or my lack of
+ * understanding? Anyway, without custom invalidation messages it looks like
+ * we have no alternatives.
+ */
+static void
+check_state(ParseState *pstate, Query *query, JumbleState *jstate)
+{
+	HASH_SEQ_STATUS hash_seq;
+	uint64			generation;
+	MentorTblEntry *entry;
+	char			**names = NULL;
+
+	/* Call in advance. If something will trigger an error we just skip it */
+	if (prev_post_parse_analyze_hook)
+		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
+
+	generation = pg_atomic_read_u64(&state->state_generation);
+
+	if (generation == local_state_generation)
+		return;
+
+	get_stmt_names(names);
+
+	/*
+	 * Pass through all the table, match prepared statement with the same
+	 * queryId and set up plan type options.
+	 */
+	hash_seq_init(&hash_seq, pgm_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+
+	}
+
+	local_state_generation = generation;
+}
+
+static void
+pgm_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(sizeof(SharedState) +
+							hash_estimate_size(max_records_num,
+											   sizeof(MentorTblEntry)));
+}
+
+static void
+pgm_shmem_startup(void)
+{
+	HASHCTL		info;
+	bool		found;
+
+	state = NULL;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	/*
+	 * Create or attach to the shared memory state, including hash table
+	 */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	state = ShmemInitStruct(MODULENAME, sizeof(SharedState), &found);
+
+	if (!found)
+	{
+		pg_atomic_init_u64(&state->state_generation, 1);
+	}
+
+	info.keysize = sizeof(uint64);
+	info.entrysize = sizeof(MentorTblEntry);
+	pgm_hash = ShmemInitHash(MODULENAME" hash", max_records_num,
+							 max_records_num, &info,
+							 HASH_ELEM | HASH_BLOBS);
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+void
+_PG_init(void)
+{
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg(MODULENAME" extension could be loaded only on startup."),
+				 errdetail("Add into the shared_preload_libraries list.")));
+
+	/* Cache oid for further direct calls */
+	psfuncoid = fmgr_internal_function(psfuncname);
+	Assert(psfuncoid != InvalidOid);
+
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pgm_shmem_request;
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pgm_shmem_startup;
+
+	post_parse_analyze_hook = prev_post_parse_analyze_hook;
+	post_parse_analyze_hook = check_state;
+
+	MarkGUCPrefixReserved(MODULENAME);
+}

@@ -1,0 +1,6 @@
+# pg_mentor extension
+comment = 'pg_mentor - manage query parameters'
+default_version = '0.1'
+module_pathname = '$libdir/pg_mentor'
+relocatable = true
+requires = 'pg_stat_statements'
