@@ -1,0 +1,45 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_prepare s2_prepare s1_generic s2_show s1_show s1_custom s2_show s1_show
+step s1_prepare: PREPARE stmt1(integer) AS SELECT * FROM test WHERE x = $1;
+step s2_prepare: PREPARE stmt2(integer) AS SELECT * FROM test WHERE x = $1;
+step s1_generic: SELECT count(*) FROM get_queryId('EXECUTE stmt1(1)') AS q(query_id), LATERAL (SELECT * FROM pg_mentor_set_plan_mode(q.query_id::bigint, 1));
+count
+-----
+    1
+(1 row)
+
+step s2_show: EXPLAIN (COSTS OFF) EXECUTE stmt2(1);
+QUERY PLAN        
+------------------
+Seq Scan on test  
+  Filter: (x = $1)
+(2 rows)
+
+step s1_show: EXPLAIN (COSTS OFF) EXECUTE stmt1(1);
+QUERY PLAN        
+------------------
+Seq Scan on test  
+  Filter: (x = $1)
+(2 rows)
+
+step s1_custom: SELECT count(*) FROM get_queryId('EXECUTE stmt1(1)') AS q(query_id), LATERAL (SELECT * FROM pg_mentor_set_plan_mode(q.query_id::bigint, 2));
+count
+-----
+    1
+(1 row)
+
+step s2_show: EXPLAIN (COSTS OFF) EXECUTE stmt2(1);
+QUERY PLAN       
+-----------------
+Seq Scan on test 
+  Filter: (x = 1)
+(2 rows)
+
+step s1_show: EXPLAIN (COSTS OFF) EXECUTE stmt1(1);
+QUERY PLAN       
+-----------------
+Seq Scan on test 
+  Filter: (x = 1)
+(2 rows)
+

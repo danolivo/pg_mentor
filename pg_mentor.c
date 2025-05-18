@@ -71,9 +71,6 @@ set_plan_cache_mode(PreparedStatement  *entry, int status)
 	{
 		case 0:
 			/* PLAN_CACHE_MODE_AUTO */
-			if ((entry->plansource->cursor_options &
-				(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN)) == 0)
-				elog(WARNING, "The PLAN_CACHE_MODE_AUTO has already been set up");
 			entry->plansource->cursor_options &=
 							~(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN);
 			break;

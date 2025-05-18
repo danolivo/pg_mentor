@@ -14,6 +14,11 @@ REGRESS = pg_mentor
 
 EXTRA_INSTALL = contrib/pg_stat_statements
 
+ISOLATION = pg_mentor_isolation
+ISOLATION_OPTS = --temp-config $(top_srcdir)/contrib/pg_mentor/pg_mentor.conf \
+				--load-extension=pg_stat_statements \
+				--load-extension=pg_mentor
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
