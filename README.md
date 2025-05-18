@@ -1,6 +1,6 @@
 # pg_mentor
 
-Employ query statistics stored in pg_stat_statements to decide which type of plan mode (custom, generic or auto) to use.
+Employ query statistics stored in the `pg_stat_statements` extension to decide which type of plan mode (custom, generic or auto) to use.
 
 # How to use
 Install it, load on startup as well as the `pg_stat_statements` module and call:
