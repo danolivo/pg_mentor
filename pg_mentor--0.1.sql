@@ -34,3 +34,22 @@ CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint, status integer)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
 LANGUAGE C;
+
+--
+-- Demo routine:
+-- Implements strategy that detect queries which have planning time much more
+-- than max execution time and force generic plan on them.
+--
+CREATE FUNCTION pg_mentor_nail_long_planned()
+RETURNS integer AS $$
+DECLARE
+  cnt integer;
+BEGIN
+  SELECT count(*) FROM (
+    SELECT queryid::bigint FROM pg_stat_statements
+	  WHERE max_exec_time < mean_plan_time) AS q(queryid)
+    JOIN LATERAL (SELECT pg_mentor_set_plan_mode(q.queryid, 1)) AS q1(result)
+    ON (q1.result = TRUE) INTO cnt;
+  RETURN cnt;
+END;
+$$ LANGUAGE plpgsql;

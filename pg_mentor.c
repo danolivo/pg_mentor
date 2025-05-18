@@ -17,6 +17,7 @@
 #include "executor/executor.h"
 #include "nodes/execnodes.h"
 #include "miscadmin.h"
+#include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -40,6 +41,7 @@ static Oid		   psfuncoid = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 /*
  * Single flag for all databases?
@@ -160,16 +162,12 @@ fetch_prepared_statements(void)
  * we have no alternatives.
  */
 static void
-check_state(ParseState *pstate, Query *query, JumbleState *jstate)
+check_state(void)
 {
 	HASH_SEQ_STATUS hash_seq;
 	uint64			generation;
 	MentorTblEntry *entry;
 	List		   *pslst;
-
-	/* Call in advance. If something triggers an error we skip further code */
-	if (prev_post_parse_analyze_hook)
-		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
 
 	generation = pg_atomic_read_u64(&state->state_generation);
 
@@ -229,18 +227,24 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	int				status = PG_GETARG_INT32(1);
 	bool			found;
 	MentorTblEntry *entry;
+	bool				result = false;
 
 	if (!LWLockConditionalAcquire(state->lock, LW_EXCLUSIVE))
 		PG_RETURN_BOOL(false);
 
 	entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId, HASH_ENTER, &found);
-	entry->plan_cache_mode = status;
+	if (!found || entry->plan_cache_mode != status)
+	{
+		entry->plan_cache_mode = status;
+		result = true;
+	}
+
 	LWLockRelease(state->lock);
 
 	/* Tell other backends that they may update their statuses. */
 	move_mentor_status();
 
-	PG_RETURN_BOOL(true);
+	PG_RETURN_BOOL(result);
 }
 
 static void
@@ -288,6 +292,32 @@ pgm_shmem_startup(void)
 	LWLockRelease(AddinShmemInitLock);
 }
 
+static void
+pgm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+{
+	/* Call in advance. If something triggers an error we skip further code */
+	if (prev_post_parse_analyze_hook)
+		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
+
+	check_state();
+}
+
+static PlannedStmt *
+pgm_planner(Query *parse, const char *query_string,
+			int cursorOptions, ParamListInfo boundParams)
+{
+	PlannedStmt *result;
+
+	if (prev_planner_hook)
+		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
+	else
+		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+
+	check_state();
+
+	return result;
+}
+
 void
 _PG_init(void)
 {
@@ -306,8 +336,10 @@ _PG_init(void)
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgm_shmem_startup;
 
-	post_parse_analyze_hook = prev_post_parse_analyze_hook;
-	post_parse_analyze_hook = check_state;
+	prev_post_parse_analyze_hook = post_parse_analyze_hook;
+	post_parse_analyze_hook = pgm_post_parse_analyze;
+	prev_planner_hook = planner_hook;
+	planner_hook = pgm_planner;
 
 	MarkGUCPrefixReserved(MODULENAME);
 }

@@ -35,5 +35,37 @@ EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- custom plan
 SELECT pg_mentor_set_plan_mode(:query_id, 0);
 EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- auto mode
 
+-- Prepare the case when custom plan cost all the time much less than the
+-- generic one
+CREATE TABLE part (
+	id int
+) PARTITION BY RANGE (id);
+CREATE TABLE part1 PARTITION OF part FOR VALUES FROM (0) to (100);
+CREATE TABLE part2 PARTITION OF part FOR VALUES FROM (100) to (200);
+INSERT INTO part (id) SELECT x%200 FROM generate_series(1,1E4) AS x;
+CREATE INDEX part_idx_1 ON part (id);
+CREATE INDEX part_idx_2 ON part (id);
+CREATE INDEX part_idx_3 ON part (id);
+VACUUM ANALYZE part,part1,part2;
+
+PREPARE qry (integer) AS SELECT * FROM part WHERE id IN ($1, $1+1);
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1);
+
+EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
+SELECT pg_mentor_nail_long_planned();
+EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
+
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;
