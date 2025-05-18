@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "commands/prepare.h"
+#include "executor/executor.h"
 #include "nodes/execnodes.h"
 #include "miscadmin.h"
 #include "parser/analyze.h"
@@ -22,7 +23,6 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
-#include "utils/syscache.h"
 
 #define MODULENAME	"pg_mentor"
 
@@ -31,7 +31,8 @@ PG_MODULE_MAGIC_EXT(
 					.version = PG_VERSION
 );
 
-PG_FUNCTION_INFO_V1(set_prepared_statement_status);
+PG_FUNCTION_INFO_V1(pg_mentor_reload_conf);
+PG_FUNCTION_INFO_V1(pg_mentor_set_plan_mode);
 
 static const char *psfuncname = "pg_prepared_statement";
 static Oid		   psfuncoid = 0;
@@ -40,14 +41,18 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 
+/*
+ * Single flag for all databases?
+ */
 typedef struct SharedState
 {
-	pg_atomic_uint64 state_generation;
+	LWLock			   *lock;
+	pg_atomic_uint64	state_generation;
 } SharedState;
 
 typedef struct MentorTblEntry
 {
-	uint64		queryid;
+	uint64		queryid; /* the key */
 	int			plan_cache_mode;
 	TimestampTz	since;
 } MentorTblEntry;
@@ -59,26 +64,16 @@ static int max_records_num = 1024;
 
 static uint64 local_state_generation = 0; /* 0 - not initialised */
 
-Datum
-set_prepared_statement_status(PG_FUNCTION_ARGS)
+static void
+set_plan_cache_mode(PreparedStatement  *entry, int status)
 {
-	const char		   *stmt_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int					status = PG_GETARG_INT32(1);
-	PreparedStatement  *entry;
-
-	if (status < 0 || status > 2)
-		ereport(ERROR,
-				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("plan cache mode %d is out of valid range", status));
-
-	entry = FetchPreparedStatement(stmt_name, false);
-	if (entry == NULL)
-		PG_RETURN_BOOL(false);
-
 	switch (status)
 	{
 		case 0:
 			/* PLAN_CACHE_MODE_AUTO */
+			if ((entry->plansource->cursor_options &
+				(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN)) == 0)
+				elog(WARNING, "The PLAN_CACHE_MODE_AUTO has already been set up");
 			entry->plansource->cursor_options &=
 							~(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN);
 			break;
@@ -95,43 +90,64 @@ set_prepared_statement_status(PG_FUNCTION_ARGS)
 		default:
 			Assert(0);
 	}
-
-	PG_RETURN_BOOL(true);
 }
 
-#include "executor/spi.h"
-
-static int
-get_stmt_names(char **names)
+/*
+ * Call pg_prepared_statement and return list of statement names.
+ *
+ * Returns list of PreparedStatement pointers
+ */
+static List *
+fetch_prepared_statements(void)
 {
-	SPITupleTable	   *spi_tuptable;
-	TupleDesc			spi_tupdesc;
-	HeapTuple			spi_tuple;
-	int64				i;
-	int					ret;
-	uint64				proc;
+	FunctionCallInfo	fcinfo = palloc0(SizeForFunctionCallInfo(0));
+	ReturnSetInfo		rsinfo;
+	FmgrInfo			ps_fmgr_info;
+	List			   *pslst = NIL;
+	int64				nvalues;
 
-	SPI_connect();
-	ret = SPI_execute("SELECT * FROM pg_prepared_statement()", true, 0);
-	proc = SPI_processed;
+	/*
+	 * Settings to call SRF routine. See InitMaterializedSRF.
+	 */
+	rsinfo.type = T_ReturnSetInfo;
+	rsinfo.econtext = CreateStandaloneExprContext();
+	rsinfo.expectedDesc = NULL;
+	rsinfo.allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
+	rsinfo.returnMode = SFRM_Materialize;
+	rsinfo.setResult = NULL;
+	rsinfo.setDesc = NULL;
 
-	if (ret != SPI_OK_SELECT || proc == 0)
+	fmgr_info(psfuncoid, &ps_fmgr_info);
+	InitFunctionCallInfoData(*fcinfo, &ps_fmgr_info, 0, InvalidOid, NULL, NULL);
+	fcinfo->resultinfo = (Node *) &rsinfo;
+
+	(void) FunctionCallInvoke(fcinfo);
+
+	nvalues = tuplestore_tuple_count(rsinfo.setResult);
+
+	if (nvalues > 0)
 	{
-		SPI_finish();
-		return 0;
+		TupleTableSlot *slot;
+
+		slot = MakeSingleTupleTableSlot(rsinfo.setDesc, &TTSOpsMinimalTuple);
+		while (tuplestore_gettupleslot(rsinfo.setResult, true, false, slot))
+		{
+			char			   *stmt_name;
+			bool				isnull;
+			PreparedStatement   *ps;
+
+			stmt_name = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
+			Assert(!isnull);
+
+			ps = FetchPreparedStatement(stmt_name, false);
+			if (ps != NULL)
+				pslst = lappend(pslst, ps);
+
+			ExecClearTuple(slot);
+		}
 	}
 
-	spi_tuptable = SPI_tuptable;
-	spi_tupdesc = spi_tuptable->tupdesc;
-
-	*names = palloc(proc * sizeof(char *));
-	for (i = 0; i < proc; i++)
-	{
-		spi_tuple = spi_tuptable->vals[i];
-		names[i] = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-	}
-
-	return proc;
+	return pslst;
 }
 
 /*
@@ -152,9 +168,9 @@ check_state(ParseState *pstate, Query *query, JumbleState *jstate)
 	HASH_SEQ_STATUS hash_seq;
 	uint64			generation;
 	MentorTblEntry *entry;
-	char			**names = NULL;
+	List		   *pslst;
 
-	/* Call in advance. If something will trigger an error we just skip it */
+	/* Call in advance. If something triggers an error we skip further code */
 	if (prev_post_parse_analyze_hook)
 		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
 
@@ -163,19 +179,71 @@ check_state(ParseState *pstate, Query *query, JumbleState *jstate)
 	if (generation == local_state_generation)
 		return;
 
-	get_stmt_names(names);
+	pslst = fetch_prepared_statements();
+
+	if (list_length(pslst) == 0)
+		return;
 
 	/*
 	 * Pass through all the table, match prepared statement with the same
 	 * queryId and set up plan type options.
 	 */
+	LWLockAcquire(state->lock, LW_SHARED);
 	hash_seq_init(&hash_seq, pgm_hash);
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
 	{
+		ListCell *lc;
 
+		foreach(lc, pslst)
+		{
+			PreparedStatement *ps = (PreparedStatement *) lfirst(lc);
+			Query *query = linitial_node(Query, ps->plansource->query_list);
+
+			if (query->queryId != entry->queryid)
+				continue;
+
+			set_plan_cache_mode(ps, entry->plan_cache_mode);
+		}
 	}
+	LWLockRelease(state->lock);
 
-	local_state_generation = generation;
+	if (local_state_generation < generation)
+		local_state_generation = generation;
+}
+
+static bool
+move_mentor_status()
+{
+	pg_atomic_fetch_add_u64(&state->state_generation, 1);
+	return true;
+}
+
+Datum
+pg_mentor_reload_conf(PG_FUNCTION_ARGS)
+{
+	move_mentor_status();
+	PG_RETURN_BOOL(true);
+}
+
+Datum
+pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
+{
+	int64			queryId = PG_GETARG_INT64(0);
+	int				status = PG_GETARG_INT32(1);
+	bool			found;
+	MentorTblEntry *entry;
+
+	if (!LWLockConditionalAcquire(state->lock, LW_EXCLUSIVE))
+		PG_RETURN_BOOL(false);
+
+	entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId, HASH_ENTER, &found);
+	entry->plan_cache_mode = status;
+	LWLockRelease(state->lock);
+
+	/* Tell other backends that they may update their statuses. */
+	move_mentor_status();
+
+	PG_RETURN_BOOL(true);
 }
 
 static void
@@ -187,6 +255,7 @@ pgm_shmem_request(void)
 	RequestAddinShmemSpace(sizeof(SharedState) +
 							hash_estimate_size(max_records_num,
 											   sizeof(MentorTblEntry)));
+	RequestNamedLWLockTranche(MODULENAME, 1);
 }
 
 static void
@@ -209,6 +278,7 @@ pgm_shmem_startup(void)
 
 	if (!found)
 	{
+		state->lock = &(GetNamedLWLockTranche(MODULENAME))->lock;
 		pg_atomic_init_u64(&state->state_generation, 1);
 	}
 
