@@ -37,6 +37,7 @@ EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- auto mode
 
 -- Prepare the case when custom plan cost all the time much less than the
 -- generic one
+SELECT count(*) FROM pg_stat_statements_reset();
 CREATE TABLE part (
 	id int
 ) PARTITION BY RANGE (id);
@@ -66,6 +67,11 @@ EXECUTE qry(1);
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
 SELECT pg_mentor_nail_long_planned();
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
+
+SELECT query, plan_cache_mode, calls
+FROM pg_stat_statements pgss, pg_mentor_show_managed_queries(-1) pgmq
+WHERE pgss.queryid = pgmq.queryid
+ORDER BY md5(query);
 
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;

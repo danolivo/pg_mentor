@@ -36,6 +36,17 @@ AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
 LANGUAGE C;
 
 --
+-- Returns description of queries that are under control at the moment
+--
+CREATE FUNCTION pg_mentor_show_managed_queries(IN status integer,
+  OUT queryid bigint,
+  OUT plan_cache_mode int,
+  OUT since TimestampTz)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_mentor_show_managed_queries'
+LANGUAGE C;
+
+--
 -- Demo routine:
 -- Implements strategy that detect queries which have planning time much more
 -- than max execution time and force generic plan on them.

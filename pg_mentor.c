@@ -15,6 +15,7 @@
 
 #include "commands/prepare.h"
 #include "executor/executor.h"
+#include "funcapi.h"
 #include "nodes/execnodes.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
@@ -34,6 +35,7 @@ PG_MODULE_MAGIC_EXT(
 
 PG_FUNCTION_INFO_V1(pg_mentor_reload_conf);
 PG_FUNCTION_INFO_V1(pg_mentor_set_plan_mode);
+PG_FUNCTION_INFO_V1(pg_mentor_show_managed_queries);
 
 static const char *psfuncname = "pg_prepared_statement";
 static Oid		   psfuncoid = 0;
@@ -54,7 +56,7 @@ typedef struct SharedState
 
 typedef struct MentorTblEntry
 {
-	uint64		queryid; /* the key */
+	int64		queryid; /* the key */
 	int			plan_cache_mode;
 	TimestampTz	since;
 } MentorTblEntry;
@@ -245,6 +247,38 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	move_mentor_status();
 
 	PG_RETURN_BOOL(result);
+}
+#include "utils/timestamp.h"
+#define MANAGED_QUERIES_NUM	(3)
+Datum
+pg_mentor_show_managed_queries(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASH_SEQ_STATUS hash_seq;
+	MentorTblEntry *entry;
+	Datum		values[MANAGED_QUERIES_NUM];
+	bool		nulls[MANAGED_QUERIES_NUM] = {0};
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	LWLockAcquire(state->lock, LW_SHARED);
+	if (hash_get_num_entries(pgm_hash) <= 0)
+	{
+		LWLockRelease(state->lock);
+		return (Datum) 0;
+	}
+
+	hash_seq_init(&hash_seq, pgm_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		values[0] = Int64GetDatumFast(entry->queryid);
+		values[1] = Int32GetDatum(entry->plan_cache_mode);
+		values[2] = TimestampTzGetDatum(entry->since);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	LWLockRelease(state->lock);
+
+	return (Datum) 0;
 }
 
 static void
