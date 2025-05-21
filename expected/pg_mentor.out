@@ -1,5 +1,18 @@
 CREATE EXTENSION pg_mentor CASCADE;
-NOTICE:  installing required extension "pg_stat_statements"
+CREATE FUNCTION show_entries()
+RETURNS TABLE (
+  refcounter		integer,
+  plan_cache_mode	integer,
+  calls				bigint,
+  query				text
+)  AS $$
+BEGIN
+  RETURN QUERY
+    SELECT p.refcounter,p.plan_cache_mode,s.calls,s.query
+    FROM pg_mentor_show_prepared_statements(-1) p JOIN
+	  pg_stat_statements s USING (queryid);
+END;
+$$ LANGUAGE PLPGSQL;
 CREATE OR REPLACE FUNCTION expln(query_string text) RETURNS SETOF text AS $$
 BEGIN
     RETURN QUERY
@@ -152,7 +165,7 @@ EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
 SELECT pg_mentor_nail_long_planned();
  pg_mentor_nail_long_planned 
 -----------------------------
-                           7
+                           4
 (1 row)
 
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
@@ -163,6 +176,18 @@ EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
    ->  Index Only Scan using part1_id_idx2 on part1 part_1
          Index Cond: (id = ANY (ARRAY[$1, ($1 + 1)]))
 (4 rows)
+
+SELECT refcounter,calls,plan_cache_mode,query
+FROM show_entries()
+ORDER BY md5(query);
+ refcounter | calls | plan_cache_mode |                   query                   
+------------+-------+-----------------+-------------------------------------------
+          1 |     8 |               1 | SELECT * FROM part WHERE id IN ($1, $1+1)
+          0 |     1 |               1 | SELECT $1+$2 AS x
+          0 |     1 |               1 | SELECT sqrt($1+$2) AS x
+          0 |     1 |               0 | SELECT $1+random() AS x
+          1 |     5 |               1 | SELECT * FROM test WHERE x = $1
+(5 rows)
 
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;

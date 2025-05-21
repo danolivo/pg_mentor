@@ -38,12 +38,18 @@ LANGUAGE C;
 --
 -- Returns description of queries that are under control at the moment
 --
-CREATE FUNCTION pg_mentor_show_managed_queries(IN status integer,
+CREATE FUNCTION pg_mentor_show_prepared_statements(IN status integer,
   OUT queryid bigint,
+  OUT refcounter integer,
   OUT plan_cache_mode int,
   OUT since TimestampTz)
 RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'pg_mentor_show_managed_queries'
+AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
+LANGUAGE C;
+
+CREATE FUNCTION pg_mentor_reset()
+RETURNS integer
+AS 'MODULE_PATHNAME', 'pg_mentor_reset'
 LANGUAGE C;
 
 --
@@ -58,7 +64,7 @@ DECLARE
 BEGIN
   SELECT count(*) FROM (
     SELECT queryid::bigint FROM pg_stat_statements
-	  WHERE max_exec_time < mean_plan_time) AS q(queryid)
+	WHERE queryid IN (SELECT queryid FROM pg_mentor_show_prepared_statements(-1)) AND max_exec_time < mean_plan_time) AS q(queryid)
     JOIN LATERAL (SELECT pg_mentor_set_plan_mode(q.queryid, 1)) AS q1(result)
     ON (q1.result = TRUE) INTO cnt;
   RETURN cnt;
