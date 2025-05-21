@@ -23,8 +23,10 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 
 #define MODULENAME	"pg_mentor"
 
@@ -35,7 +37,8 @@ PG_MODULE_MAGIC_EXT(
 
 PG_FUNCTION_INFO_V1(pg_mentor_reload_conf);
 PG_FUNCTION_INFO_V1(pg_mentor_set_plan_mode);
-PG_FUNCTION_INFO_V1(pg_mentor_show_managed_queries);
+PG_FUNCTION_INFO_V1(pg_mentor_show_prepared_statements);
+PG_FUNCTION_INFO_V1(pg_mentor_reset);
 
 static const char *psfuncname = "pg_prepared_statement";
 static Oid		   psfuncoid = 0;
@@ -44,6 +47,7 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 /*
  * Single flag for all databases?
@@ -54,19 +58,25 @@ typedef struct SharedState
 	pg_atomic_uint64	state_generation;
 } SharedState;
 
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(4)
+
 typedef struct MentorTblEntry
 {
 	int64		queryid; /* the key */
+	uint32		refcounter; /* How much users use this statement? */
 	int			plan_cache_mode;
-	TimestampTz	since;
+	TimestampTz	since; /* The moment of addition to the table */
 } MentorTblEntry;
 
 static SharedState *state = NULL;
 static HTAB		   *pgm_hash = NULL;
+static HTAB		   *pgm_local_hash = NULL; /* contains statements, prepared in this backend */
 
 static int max_records_num = 1024;
 
 static uint64 local_state_generation = 0; /* 0 - not initialised */
+
+static void on_deallocate(uint64 queryId);
 
 static void
 set_plan_cache_mode(PreparedStatement  *entry, int status)
@@ -135,14 +145,14 @@ fetch_prepared_statements(void)
 		{
 			char			   *stmt_name;
 			bool				isnull;
-			PreparedStatement   *ps;
+			PreparedStatement  *ps;
 
 			stmt_name = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
 			Assert(!isnull);
 
 			ps = FetchPreparedStatement(stmt_name, false);
-			if (ps != NULL)
-				pslst = lappend(pslst, ps);
+			Assert(ps != NULL);
+			pslst = lappend(pslst, ps);
 
 			ExecClearTuple(slot);
 		}
@@ -150,6 +160,16 @@ fetch_prepared_statements(void)
 
 	return pslst;
 }
+
+/*
+ * The prepared_queries hash table is private core entity. So let's manage the
+ * extension internal hash table. It can help us to cleanup global table on
+ * backend exit.
+ */
+typedef struct LocaLPSEntry
+{
+	uint64 queryId;
+} LocaLPSEntry;
 
 /*
  * Does prepared statements table changed?
@@ -229,7 +249,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	int				status = PG_GETARG_INT32(1);
 	bool			found;
 	MentorTblEntry *entry;
-	bool				result = false;
+	bool			result = false;
 
 	if (!LWLockConditionalAcquire(state->lock, LW_EXCLUSIVE))
 		PG_RETURN_BOOL(false);
@@ -248,16 +268,15 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(result);
 }
-#include "utils/timestamp.h"
-#define MANAGED_QUERIES_NUM	(3)
+
 Datum
-pg_mentor_show_managed_queries(PG_FUNCTION_ARGS)
+pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	HASH_SEQ_STATUS hash_seq;
 	MentorTblEntry *entry;
-	Datum		values[MANAGED_QUERIES_NUM];
-	bool		nulls[MANAGED_QUERIES_NUM] = {0};
+	Datum		values[MENTOR_TBL_ENTRY_FIELDS_NUM];
+	bool		nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
 
 	InitMaterializedSRF(fcinfo, 0);
 
@@ -272,13 +291,45 @@ pg_mentor_show_managed_queries(PG_FUNCTION_ARGS)
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
 	{
 		values[0] = Int64GetDatumFast(entry->queryid);
-		values[1] = Int32GetDatum(entry->plan_cache_mode);
-		values[2] = TimestampTzGetDatum(entry->since);
+		values[1] = UInt64GetDatum(entry->refcounter);
+		values[2] = Int32GetDatum(entry->plan_cache_mode);
+		values[3] = TimestampTzGetDatum(entry->since);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	LWLockRelease(state->lock);
 
 	return (Datum) 0;
+}
+
+/*
+ * Clean all decisions has been made
+ */
+Datum
+pg_mentor_reset(PG_FUNCTION_ARGS)
+{
+	HASH_SEQ_STATUS hash_seq;
+	MentorTblEntry *entry;
+	int32			counter = 0;
+
+	LWLockAcquire(state->lock, LW_SHARED);
+
+	if (hash_get_num_entries(pgm_hash) <= 0)
+	{
+		LWLockRelease(state->lock);
+		PG_RETURN_INT32(counter);
+	}
+
+	hash_seq_init(&hash_seq, pgm_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		if (entry->plan_cache_mode != 0)
+		{
+			entry->plan_cache_mode = 0;
+			counter++;
+		}
+	}
+	LWLockRelease(state->lock);
+	PG_RETURN_INT32(counter);
 }
 
 static void
@@ -352,6 +403,238 @@ pgm_planner(Query *parse, const char *query_string,
 	return result;
 }
 
+static uint64
+get_prepared_stmt_queryId(PreparedStatement  *ps)
+{
+	ListCell		   *lc;
+
+	/* To follow this logic check postgres.c and 933848d */
+	foreach(lc, ps->plansource->query_list)
+	{
+		Query	   *query = lfirst_node(Query, lc);
+
+		if (query->queryId == UINT64CONST(0))
+			continue;
+		return query->queryId;
+
+	}
+	return UINT64CONST(0);
+}
+
+static bool before_shmem_exit_initialised = false;
+
+static void
+before_backend_shutdown(int code, Datum arg)
+{
+	on_deallocate(UINT64CONST(0));
+}
+
+static void
+recreate_local_htab()
+{
+	HASHCTL		ctl;
+
+	if (pgm_local_hash != NULL)
+		hash_destroy(pgm_local_hash);
+
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(LocaLPSEntry);
+	pgm_local_hash = hash_create("pg_mentor PS hash", 128, &ctl,
+								 HASH_ELEM | HASH_BLOBS);
+}
+
+static uint32
+on_prepare(PreparedStatement  *ps)
+{
+	int64				queryId = get_prepared_stmt_queryId(ps);
+	MentorTblEntry	   *entry;
+	bool				found;
+	uint32				refcounter;
+
+	if (queryId == UINT64CONST(0))
+		return -1;
+
+	LWLockAcquire(state->lock, LW_EXCLUSIVE);
+	entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId, HASH_ENTER, &found);
+
+	if (found)
+		entry->refcounter++;
+	else
+	{
+		/* Initialise new entry */
+		entry->refcounter = 1;
+		entry->plan_cache_mode = ps->plansource->cursor_options &
+							(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN);
+		entry->since = GetCurrentTimestamp();
+	}
+	refcounter = entry->refcounter;
+	LWLockRelease(state->lock);
+
+	/* Don't forget to insert it locally */
+	(void) hash_search(pgm_local_hash, &queryId, HASH_ENTER, &found);
+	Assert(!found);
+
+	/* Don't trust to big numbers */
+	Assert(refcounter < UINT32_MAX - 1);
+
+	if (!before_shmem_exit_initialised)
+	{
+		before_shmem_exit(before_backend_shutdown, 0);
+		before_shmem_exit_initialised = true;
+	}
+
+	return refcounter;
+}
+
+/*
+ * HTAB has been reset globally
+ */
+static int32
+on_global_reset()
+{
+}
+
+/*
+ * Some sort of deallocation is coming.
+ *
+ * Find the record in global HTAB and decrease refcounter.
+ * Remove the record from the local HTAB.
+ */
+static void
+on_deallocate(uint64 queryId)
+{
+	MentorTblEntry	   *entry;
+	bool				found;
+
+	LWLockAcquire(state->lock, LW_EXCLUSIVE);
+
+	if (queryId != UINT64CONST(0))
+	{
+		entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId,
+											   HASH_FIND, &found);
+		if (found)
+		{
+			entry->refcounter--;
+			Assert(entry->refcounter < UINT32_MAX - 1);
+			(void) hash_search(pgm_local_hash, &queryId, HASH_REMOVE, NULL);
+		}
+#ifdef USE_ASSERT_CHECKING
+		else
+		{
+			(void) hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
+			Assert(!found);
+		}
+#endif
+	}
+	else
+	{
+		HASH_SEQ_STATUS hash_seq;
+		LocaLPSEntry   *data;
+
+		hash_seq_init(&hash_seq, pgm_local_hash);
+		while ((data = hash_seq_search(&hash_seq)) != NULL)
+		{
+			Assert(data->queryId != UINT64CONST(0));
+
+			entry = (MentorTblEntry *) hash_search(pgm_hash, &data->queryId,
+												   HASH_FIND, &found);
+			if (found)
+			{
+				entry->refcounter--;
+				Assert(entry->refcounter < UINT32_MAX - 1);
+			}
+
+			/*
+			 * Sometimes we may not find this entry in global HTAB having in the
+			 * local one (reset). But still should delete it locally.
+			 */
+			(void) hash_search(pgm_local_hash, &data->queryId, HASH_REMOVE, NULL);
+		}
+	}
+	LWLockRelease(state->lock);
+}
+
+/*
+ * Utility hook.
+ *
+ * Manage PREPARED STATEMENT entries in the global hash table.
+ *
+ * At the end of PREPARE or DEALLOCATE statement add queryId of the
+ * statement into the global hash table. In case of deallocation just reduce
+ * refcounter and let it exist in the table for much longer.
+ *
+ * Supply it with timestamp to let future clean procedure know how old is
+ * this entry.
+ *
+ * It is not all the add/remove machinery because prepared statement refcounter
+ * may be reduced in case of died process or else accidents (need to be
+ * discovered). So, we also need manual cleaner to remove old/unused/unmanaged
+ * entries from the table.
+ */
+static void
+pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
+						bool readOnlyTree, ProcessUtilityContext context,
+						ParamListInfo params, QueryEnvironment *queryEnv,
+						DestReceiver *dest, QueryCompletion *qc)
+{
+	Node   *parsetree = pstmt->utilityStmt;
+	uint64	queryId = UINT64CONST(0);
+	bool	deallocate_all = false;
+
+	/*
+	 * Need to save queryId in advance, because deallocate operation removes
+	 * the entry from the prepared statements hash table.
+	 */
+	if (IsA(parsetree, DeallocateStmt))
+	{
+		DeallocateStmt	   *stmt = (DeallocateStmt *) parsetree;
+
+		if (stmt->name != NULL)
+		{
+			PreparedStatement  *ps = FetchPreparedStatement(stmt->name, false);
+
+			queryId = (ps == NULL) ?	UINT64CONST(0) :
+										get_prepared_stmt_queryId(ps);
+		}
+		else
+			deallocate_all = true;
+	}
+
+	if (prev_ProcessUtility_hook)
+		(*prev_ProcessUtility_hook) (pstmt, queryString, readOnlyTree,
+									 context, params, queryEnv,
+									 dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+								context, params, queryEnv,
+								dest, qc);
+
+	/*
+	 * Now operation is finished successfully and we may do the job. Use
+	 * the same terminology as the standard_ProcessUtility does.
+	 */
+
+	switch (nodeTag(parsetree))
+	{
+		case T_PrepareStmt:
+		{
+			PrepareStmt		   *stmt = (PrepareStmt *) parsetree;
+			PreparedStatement  *ps = FetchPreparedStatement(stmt->name, true);
+
+			on_prepare(ps);
+		}
+			break;
+		case T_DeallocateStmt:
+		{
+			if (queryId != UINT64CONST(0) || deallocate_all)
+				on_deallocate(queryId);
+		}
+			break;
+		default:
+			break;
+	}
+}
+
 void
 _PG_init(void)
 {
@@ -374,6 +657,10 @@ _PG_init(void)
 	post_parse_analyze_hook = pgm_post_parse_analyze;
 	prev_planner_hook = planner_hook;
 	planner_hook = pgm_planner;
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = pgm_ProcessUtility_hook;
+
+	recreate_local_htab();
 
 	MarkGUCPrefixReserved(MODULENAME);
 }
