@@ -51,11 +51,19 @@ static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 /*
  * Single flag for all databases?
+ *
+ * There are two global flags exists:
+ * 1. Decisions - each time we make a decision to switch some plans to another
+ * state we should signal backends to re-read the state.
+ * 2. Prepared Statements table - if we are not sure about consistency we may
+ * reset whole table of prepared statements - in this case each backend will
+ * need to re-read its prepared statements and report them to the global state.
  */
 typedef struct SharedState
 {
 	LWLock			   *lock;
-	pg_atomic_uint64	state_generation;
+	pg_atomic_uint64	state_decisions;
+	pg_atomic_uint64	state_ps;
 } SharedState;
 
 #define MENTOR_TBL_ENTRY_FIELDS_NUM	(4)
@@ -191,7 +199,7 @@ check_state(void)
 	MentorTblEntry *entry;
 	List		   *pslst;
 
-	generation = pg_atomic_read_u64(&state->state_generation);
+	generation = pg_atomic_read_u64(&state->state_decisions);
 
 	if (generation == local_state_generation)
 		return;
@@ -231,7 +239,7 @@ check_state(void)
 static bool
 move_mentor_status()
 {
-	pg_atomic_fetch_add_u64(&state->state_generation, 1);
+	pg_atomic_fetch_add_u64(&state->state_decisions, 1);
 	return true;
 }
 
@@ -365,7 +373,7 @@ pgm_shmem_startup(void)
 	if (!found)
 	{
 		state->lock = &(GetNamedLWLockTranche(MODULENAME))->lock;
-		pg_atomic_init_u64(&state->state_generation, 1);
+		pg_atomic_init_u64(&state->state_decisions, 1);
 	}
 
 	info.keysize = sizeof(uint64);
@@ -376,13 +384,20 @@ pgm_shmem_startup(void)
 
 	LWLockRelease(AddinShmemInitLock);
 }
-
+#include "commands/extension.h"
 static void
 pgm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 {
 	/* Call in advance. If something triggers an error we skip further code */
 	if (prev_post_parse_analyze_hook)
 		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
+
+	if (!get_extension_oid(MODULENAME, true))
+		/*
+		 * Our extension doesn't exist in the database the backend is
+		 * registered in, do nothing.
+		 */
+		return;
 
 	check_state();
 }
@@ -397,6 +412,13 @@ pgm_planner(Query *parse, const char *query_string,
 		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+
+	if (!get_extension_oid(MODULENAME, true))
+		/*
+		 * Our extension doesn't exist in the database the backend is
+		 * registered in, do nothing.
+		 */
+		return result;
 
 	check_state();
 
@@ -487,14 +509,6 @@ on_prepare(PreparedStatement  *ps)
 }
 
 /*
- * HTAB has been reset globally
- */
-static int32
-on_global_reset()
-{
-}
-
-/*
  * Some sort of deallocation is coming.
  *
  * Find the record in global HTAB and decrease refcounter.
@@ -554,6 +568,22 @@ on_deallocate(uint64 queryId)
 	LWLockRelease(state->lock);
 }
 
+static void
+call_process_utility_chain(PlannedStmt *pstmt, const char *queryString,
+						bool readOnlyTree, ProcessUtilityContext context,
+						ParamListInfo params, QueryEnvironment *queryEnv,
+						DestReceiver *dest, QueryCompletion *qc)
+{
+	if (prev_ProcessUtility_hook)
+		(*prev_ProcessUtility_hook) (pstmt, queryString, readOnlyTree,
+									 context, params, queryEnv,
+									 dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+								context, params, queryEnv,
+								dest, qc);
+}
+
 /*
  * Utility hook.
  *
@@ -581,6 +611,18 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 	uint64	queryId = UINT64CONST(0);
 	bool	deallocate_all = false;
 
+	if (!get_extension_oid(MODULENAME, true))
+	{
+		/*
+		 * Our extension doesn't exist in the database the backend is
+		 * registered in, do nothing.
+		 */
+		call_process_utility_chain(pstmt, queryString, readOnlyTree,
+								   context, params, queryEnv,
+								   dest, qc);
+		return;
+	}
+
 	/*
 	 * Need to save queryId in advance, because deallocate operation removes
 	 * the entry from the prepared statements hash table.
@@ -600,14 +642,10 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 			deallocate_all = true;
 	}
 
-	if (prev_ProcessUtility_hook)
-		(*prev_ProcessUtility_hook) (pstmt, queryString, readOnlyTree,
+	/* Let the core to execute command before the further operations */
+	call_process_utility_chain(pstmt, queryString, readOnlyTree,
 									 context, params, queryEnv,
 									 dest, qc);
-	else
-		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-								context, params, queryEnv,
-								dest, qc);
 
 	/*
 	 * Now operation is finished successfully and we may do the job. Use
