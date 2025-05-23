@@ -13,16 +13,19 @@
 
 #include "postgres.h"
 
+#include "access/xact.h"
+#include "commands/extension.h"
 #include "commands/prepare.h"
 #include "executor/executor.h"
 #include "funcapi.h"
+#include "lib/dshash.h"
 #include "nodes/execnodes.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
+#include "storage/dsm_registry.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
-#include "storage/shmem.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -43,8 +46,12 @@ PG_FUNCTION_INFO_V1(pg_mentor_reset);
 static const char *psfuncname = "pg_prepared_statement";
 static Oid		   psfuncoid = 0;
 
-static shmem_request_hook_type prev_shmem_request_hook = NULL;
-static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+/*
+ * List of intercepted hooks.
+ *
+ * Each hook should cehck existence of the extension. In case it doesn't exist
+ * it should detach from shared structures, if existed.
+ */
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
@@ -61,30 +68,45 @@ static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
  */
 typedef struct SharedState
 {
-	LWLock			   *lock;
+	int					tranche_id;
 	pg_atomic_uint64	state_decisions;
-	pg_atomic_uint64	state_ps;
+
+	dsa_handle			dsah;
+	dshash_table_handle	dshh;
+
+	/* Just for DEBUG */
+	Oid					dbOid;
 } SharedState;
 
 #define MENTOR_TBL_ENTRY_FIELDS_NUM	(4)
 
 typedef struct MentorTblEntry
 {
-	int64		queryid; /* the key */
+	uint64		queryid; /* the key */
 	uint32		refcounter; /* How much users use this statement? */
 	int			plan_cache_mode;
 	TimestampTz	since; /* The moment of addition to the table */
 } MentorTblEntry;
 
-static SharedState *state = NULL;
-static HTAB		   *pgm_hash = NULL;
-static HTAB		   *pgm_local_hash = NULL; /* contains statements, prepared in this backend */
+static dsa_area *dsa = NULL;
 
-static int max_records_num = 1024;
+static dshash_parameters dsh_params = {
+	sizeof(uint64),
+	sizeof(MentorTblEntry),
+	dshash_memcmp,
+	dshash_memhash,
+	dshash_memcpy,
+	-1
+};
+
+static SharedState *state = NULL;
+static dshash_table *pgm_hash = NULL;
+static HTAB		   *pgm_local_hash = NULL; /* contains statements, prepared in this backend */
 
 static uint64 local_state_generation = 0; /* 0 - not initialised */
 
 static void on_deallocate(uint64 queryId);
+static bool pgm_init_shmem(void);
 
 static void
 set_plan_cache_mode(PreparedStatement  *entry, int status)
@@ -176,7 +198,8 @@ fetch_prepared_statements(void)
  */
 typedef struct LocaLPSEntry
 {
-	uint64 queryId;
+	uint64	queryId;
+	int32	refcounter;
 } LocaLPSEntry;
 
 /*
@@ -194,7 +217,7 @@ typedef struct LocaLPSEntry
 static void
 check_state(void)
 {
-	HASH_SEQ_STATUS hash_seq;
+	dshash_seq_status hash_seq;
 	uint64			generation;
 	MentorTblEntry *entry;
 	List		   *pslst;
@@ -213,16 +236,19 @@ check_state(void)
 	 * Pass through all the table, match prepared statement with the same
 	 * queryId and set up plan type options.
 	 */
-	LWLockAcquire(state->lock, LW_SHARED);
-	hash_seq_init(&hash_seq, pgm_hash);
-	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	dshash_seq_init(&hash_seq, pgm_hash, false);
+	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
 		ListCell *lc;
+
+		Assert(state->dbOid == MyDatabaseId);
 
 		foreach(lc, pslst)
 		{
 			PreparedStatement *ps = (PreparedStatement *) lfirst(lc);
-			Query *query = linitial_node(Query, ps->plansource->query_list);
+			Query			  *query;
+
+			query = linitial_node(Query, ps->plansource->query_list);
 
 			if (query->queryId != entry->queryid)
 				continue;
@@ -230,7 +256,7 @@ check_state(void)
 			set_plan_cache_mode(ps, entry->plan_cache_mode);
 		}
 	}
-	LWLockRelease(state->lock);
+	dshash_seq_term(&hash_seq);
 
 	if (local_state_generation < generation)
 		local_state_generation = generation;
@@ -246,6 +272,8 @@ move_mentor_status()
 Datum
 pg_mentor_reload_conf(PG_FUNCTION_ARGS)
 {
+	pgm_init_shmem();
+
 	move_mentor_status();
 	PG_RETURN_BOOL(true);
 }
@@ -259,18 +287,16 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	MentorTblEntry *entry;
 	bool			result = false;
 
-	if (!LWLockConditionalAcquire(state->lock, LW_EXCLUSIVE))
-		PG_RETURN_BOOL(false);
+	pgm_init_shmem();
 
-	entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId, HASH_ENTER, &found);
+	entry = (MentorTblEntry *) dshash_find_or_insert(pgm_hash, &queryId, &found);
 	if (!found || entry->plan_cache_mode != status)
 	{
 		entry->plan_cache_mode = status;
 		result = true;
 	}
 
-	LWLockRelease(state->lock);
-
+	dshash_release_lock(pgm_hash, entry);
 	/* Tell other backends that they may update their statuses. */
 	move_mentor_status();
 
@@ -280,31 +306,26 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 Datum
 pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	HASH_SEQ_STATUS hash_seq;
-	MentorTblEntry *entry;
-	Datum		values[MENTOR_TBL_ENTRY_FIELDS_NUM];
-	bool		nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	dshash_seq_status	hash_seq;
+	MentorTblEntry	   *entry;
+	Datum				values[MENTOR_TBL_ENTRY_FIELDS_NUM];
+	bool				nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
+
+	pgm_init_shmem();
 
 	InitMaterializedSRF(fcinfo, 0);
 
-	LWLockAcquire(state->lock, LW_SHARED);
-	if (hash_get_num_entries(pgm_hash) <= 0)
+	dshash_seq_init(&hash_seq, pgm_hash, false);
+	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
-		LWLockRelease(state->lock);
-		return (Datum) 0;
-	}
-
-	hash_seq_init(&hash_seq, pgm_hash);
-	while ((entry = hash_seq_search(&hash_seq)) != NULL)
-	{
-		values[0] = Int64GetDatumFast(entry->queryid);
+		values[0] = Int64GetDatumFast((int64) entry->queryid);
 		values[1] = UInt64GetDatum(entry->refcounter);
 		values[2] = Int32GetDatum(entry->plan_cache_mode);
 		values[3] = TimestampTzGetDatum(entry->since);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
-	LWLockRelease(state->lock);
+	dshash_seq_term(&hash_seq);
 
 	return (Datum) 0;
 }
@@ -315,20 +336,14 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 Datum
 pg_mentor_reset(PG_FUNCTION_ARGS)
 {
-	HASH_SEQ_STATUS hash_seq;
-	MentorTblEntry *entry;
-	int32			counter = 0;
+	dshash_seq_status	hash_seq;
+	MentorTblEntry	   *entry;
+	int32				counter = 0;
 
-	LWLockAcquire(state->lock, LW_SHARED);
+	pgm_init_shmem();
 
-	if (hash_get_num_entries(pgm_hash) <= 0)
-	{
-		LWLockRelease(state->lock);
-		PG_RETURN_INT32(counter);
-	}
-
-	hash_seq_init(&hash_seq, pgm_hash);
-	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	dshash_seq_init(&hash_seq, pgm_hash, true);
+	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
 		if (entry->plan_cache_mode != 0)
 		{
@@ -336,55 +351,69 @@ pg_mentor_reset(PG_FUNCTION_ARGS)
 			counter++;
 		}
 	}
-	LWLockRelease(state->lock);
+	dshash_seq_term(&hash_seq);
 	PG_RETURN_INT32(counter);
 }
 
 static void
-pgm_shmem_request(void)
+pgm_init_state(void *ptr)
 {
-	if (prev_shmem_request_hook)
-		prev_shmem_request_hook();
+	SharedState *state = (SharedState *) ptr;
 
-	RequestAddinShmemSpace(sizeof(SharedState) +
-							hash_estimate_size(max_records_num,
-											   sizeof(MentorTblEntry)));
-	RequestNamedLWLockTranche(MODULENAME, 1);
+	state->tranche_id = LWLockNewTrancheId();
+	pg_atomic_init_u64(&state->state_decisions, 1);
+	state->dbOid = MyDatabaseId;
+	Assert(OidIsValid(state->dbOid));
+
+	dsa = dsa_create(state->tranche_id);
+	dsa_pin(dsa);
+	dsa_pin_mapping(dsa);
+	dsh_params.tranche_id = state->tranche_id;
+	pgm_hash = dshash_create(dsa, &dsh_params, NULL);
+
+	/* Store handles in shared memory for other backends to use. */
+	state->dsah = dsa_get_handle(dsa);
+	state->dshh = dshash_get_hash_table_handle(pgm_hash);
 }
 
-static void
-pgm_shmem_startup(void)
+/*
+ * Init database-related shared memory segment.
+ *
+ * It should be called at the top of each hook or exported function.
+ */
+static bool
+pgm_init_shmem(void)
 {
-	HASHCTL		info;
-	bool		found;
+	bool			found;
+	char		   *segment_name;
+	MemoryContext	memctx;
 
-	state = NULL;
+	if (state != NULL)
+		return true;
 
-	if (prev_shmem_startup_hook)
-		prev_shmem_startup_hook();
+	Assert(OidIsValid(MyDatabaseId));
 
-	/*
-	 * Create or attach to the shared memory state, including hash table
-	 */
-	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	memctx = MemoryContextSwitchTo(TopMemoryContext);
+	segment_name = psprintf(MODULENAME"-%u", MyDatabaseId);
+	state = GetNamedDSMSegment(segment_name, sizeof(SharedState),
+							   pgm_init_state, &found);
 
-	state = ShmemInitStruct(MODULENAME, sizeof(SharedState), &found);
-
-	if (!found)
+	if (found)
 	{
-		state->lock = &(GetNamedLWLockTranche(MODULENAME))->lock;
-		pg_atomic_init_u64(&state->state_decisions, 1);
+		/* Attach to proper database */
+		Assert(state->dbOid == MyDatabaseId);
+
+		dsa = dsa_attach(state->dsah);
+		dsa_pin_mapping(dsa);
+		pgm_hash = dshash_attach(dsa, &dsh_params, state->dshh, NULL);
 	}
+	LWLockRegisterTranche(state->tranche_id, segment_name);
 
-	info.keysize = sizeof(uint64);
-	info.entrysize = sizeof(MentorTblEntry);
-	pgm_hash = ShmemInitHash(MODULENAME" hash", max_records_num,
-							 max_records_num, &info,
-							 HASH_ELEM | HASH_BLOBS);
-
-	LWLockRelease(AddinShmemInitLock);
+	MemoryContextSwitchTo(memctx);
+	Assert(dsa != NULL && pgm_hash != NULL);
+	return found;
 }
-#include "commands/extension.h"
+
 static void
 pgm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 {
@@ -392,12 +421,14 @@ pgm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	if (prev_post_parse_analyze_hook)
 		(*prev_post_parse_analyze_hook) (pstate, query, jstate);
 
-	if (!get_extension_oid(MODULENAME, true))
+	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
 		/*
 		 * Our extension doesn't exist in the database the backend is
 		 * registered in, do nothing.
 		 */
 		return;
+
+	pgm_init_shmem();
 
 	check_state();
 }
@@ -411,14 +442,16 @@ pgm_planner(Query *parse, const char *query_string,
 	if (prev_planner_hook)
 		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
-		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+		result = standard_planner(parse, query_string, cursorOptions, boundParams);;
 
-	if (!get_extension_oid(MODULENAME, true))
+	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
 		/*
 		 * Our extension doesn't exist in the database the backend is
 		 * registered in, do nothing.
 		 */
 		return result;
+
+	pgm_init_shmem();
 
 	check_state();
 
@@ -448,6 +481,9 @@ static bool before_shmem_exit_initialised = false;
 static void
 before_backend_shutdown(int code, Datum arg)
 {
+	if (state == NULL)
+		return;
+
 	on_deallocate(UINT64CONST(0));
 }
 
@@ -468,16 +504,17 @@ recreate_local_htab()
 static uint32
 on_prepare(PreparedStatement  *ps)
 {
-	int64				queryId = get_prepared_stmt_queryId(ps);
+	uint64				queryId = get_prepared_stmt_queryId(ps);
 	MentorTblEntry	   *entry;
+	LocaLPSEntry	   *lentry;
 	bool				found;
+	bool				found1;
 	uint32				refcounter;
 
 	if (queryId == UINT64CONST(0))
 		return -1;
 
-	LWLockAcquire(state->lock, LW_EXCLUSIVE);
-	entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId, HASH_ENTER, &found);
+	entry = (MentorTblEntry *) dshash_find_or_insert(pgm_hash, &queryId, &found);
 
 	if (found)
 		entry->refcounter++;
@@ -490,11 +527,18 @@ on_prepare(PreparedStatement  *ps)
 		entry->since = GetCurrentTimestamp();
 	}
 	refcounter = entry->refcounter;
-	LWLockRelease(state->lock);
+	dshash_release_lock(pgm_hash, entry);
 
 	/* Don't forget to insert it locally */
-	(void) hash_search(pgm_local_hash, &queryId, HASH_ENTER, &found);
-	Assert(!found);
+	lentry = (LocaLPSEntry *) hash_search(pgm_local_hash,
+										  &queryId, HASH_ENTER, &found1);
+	if (!found1)
+		lentry->refcounter = 1;
+	else
+		lentry->refcounter++;
+
+	/* If the entry doesn't exist in global entry it can't be in the local one */
+	Assert(!(!found && found1));
 
 	/* Don't trust to big numbers */
 	Assert(refcounter < UINT32_MAX - 1);
@@ -518,54 +562,71 @@ static void
 on_deallocate(uint64 queryId)
 {
 	MentorTblEntry	   *entry;
+	LocaLPSEntry	   *le;
 	bool				found;
-
-	LWLockAcquire(state->lock, LW_EXCLUSIVE);
 
 	if (queryId != UINT64CONST(0))
 	{
-		entry = (MentorTblEntry *) hash_search(pgm_hash, &queryId,
-											   HASH_FIND, &found);
+		le = (LocaLPSEntry *) hash_search(pgm_local_hash,
+										  &queryId, HASH_FIND, &found);
+		le->refcounter--;
+		if (le->refcounter == 0)
+			(void) hash_search(pgm_local_hash, &queryId, HASH_REMOVE, NULL);
+
 		if (found)
 		{
-			entry->refcounter--;
-			Assert(entry->refcounter < UINT32_MAX - 1);
-			(void) hash_search(pgm_local_hash, &queryId, HASH_REMOVE, NULL);
+			entry = (MentorTblEntry *) dshash_find(pgm_hash, &queryId, true);
+			if (entry != NULL)
+			{
+				entry->refcounter--;
+				Assert(entry->refcounter < UINT32_MAX - 1);
+
+				dshash_release_lock(pgm_hash, entry);
+			}
+			else
+			{
+				/* XXX: Is this possible? */
+			}
+
 		}
-#ifdef USE_ASSERT_CHECKING
 		else
 		{
-			(void) hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
-			Assert(!found);
+			/* XXX: Is this possible? */
 		}
-#endif
 	}
 	else
 	{
 		HASH_SEQ_STATUS hash_seq;
-		LocaLPSEntry   *data;
+
+		/*
+		 * Remove each prepared statement, registered in this backend.
+		 */
 
 		hash_seq_init(&hash_seq, pgm_local_hash);
-		while ((data = hash_seq_search(&hash_seq)) != NULL)
+		while ((le = hash_seq_search(&hash_seq)) != NULL)
 		{
-			Assert(data->queryId != UINT64CONST(0));
+			Assert(le->queryId != UINT64CONST(0));
 
-			entry = (MentorTblEntry *) hash_search(pgm_hash, &data->queryId,
-												   HASH_FIND, &found);
-			if (found)
+			entry = (MentorTblEntry *) dshash_find(pgm_hash, &le->queryId, true);
+			if (entry != NULL)
 			{
-				entry->refcounter--;
+				entry->refcounter -= le->refcounter;
 				Assert(entry->refcounter < UINT32_MAX - 1);
+
+				dshash_release_lock(pgm_hash, entry);
+			}
+			else
+			{
+				/* XXX: Is this possible? */
 			}
 
 			/*
 			 * Sometimes we may not find this entry in global HTAB having in the
 			 * local one (reset). But still should delete it locally.
 			 */
-			(void) hash_search(pgm_local_hash, &data->queryId, HASH_REMOVE, NULL);
+			(void) hash_search(pgm_local_hash, &le->queryId, HASH_REMOVE, NULL);
 		}
 	}
-	LWLockRelease(state->lock);
 }
 
 static void
@@ -611,7 +672,7 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 	uint64	queryId = UINT64CONST(0);
 	bool	deallocate_all = false;
 
-	if (!get_extension_oid(MODULENAME, true))
+	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
 	{
 		/*
 		 * Our extension doesn't exist in the database the backend is
@@ -622,6 +683,8 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 								   dest, qc);
 		return;
 	}
+
+	pgm_init_shmem();
 
 	/*
 	 * Need to save queryId in advance, because deallocate operation removes
@@ -644,8 +707,8 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 
 	/* Let the core to execute command before the further operations */
 	call_process_utility_chain(pstmt, queryString, readOnlyTree,
-									 context, params, queryEnv,
-									 dest, qc);
+							   context, params, queryEnv,
+							   dest, qc);
 
 	/*
 	 * Now operation is finished successfully and we may do the job. Use
@@ -676,20 +739,9 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 void
 _PG_init(void)
 {
-	if (!process_shared_preload_libraries_in_progress)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg(MODULENAME" extension could be loaded only on startup."),
-				 errdetail("Add into the shared_preload_libraries list.")));
-
 	/* Cache oid for further direct calls */
 	psfuncoid = fmgr_internal_function(psfuncname);
 	Assert(psfuncoid != InvalidOid);
-
-	prev_shmem_request_hook = shmem_request_hook;
-	shmem_request_hook = pgm_shmem_request;
-	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = pgm_shmem_startup;
 
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = pgm_post_parse_analyze;
