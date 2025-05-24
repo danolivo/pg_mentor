@@ -19,3 +19,6 @@ pg_stat_statements.track_utility = 'off'
 pg_stat_statements.track = 'all'
 pg_stat_statements.track_planning = 'on'
 ```
+
+# Testing
+- Quick-check on dummy issues - see this [wiki page](https://github.com/danolivo/pg_mentor/wiki/How-to-pass-make-check).
