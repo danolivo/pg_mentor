@@ -30,19 +30,25 @@ LANGUAGE C;
 -- operation and returns false. So, check the return value and re-call it again
 -- if necessary.
 --
-CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint, status integer)
+CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint,
+										status integer,
+										ref_exec_time float8 DEFAULT -1)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
 LANGUAGE C;
 
 --
 -- Returns description of queries that are under control at the moment
+-- status: -1 = return all the statements; 0 - in the "AUTO" mode;
+-- 1 - forced to build generic plan; 2 - forced to build custom plan.
 --
-CREATE FUNCTION pg_mentor_show_prepared_statements(IN status integer,
+CREATE FUNCTION pg_mentor_show_prepared_statements(
+  IN status integer,
   OUT queryid bigint,
   OUT refcounter integer,
   OUT plan_cache_mode int,
-  OUT since TimestampTz)
+  OUT since TimestampTz,
+  OUT ref_exec_time	float8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;
@@ -68,5 +74,42 @@ BEGIN
     JOIN LATERAL (SELECT pg_mentor_set_plan_mode(q.queryid, 1)) AS q1(result)
     ON (q1.result = TRUE) INTO cnt;
   RETURN cnt;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION reconsider_ps_modes(IN ncalls integer DEFAULT 0,
+    OUT to_generic integer,
+    OUT to_custom integer,
+    OUT unchanged integer
+)
+RETURNS record AS $$
+BEGIN
+--
+-- Action No.1:
+-- Probe custom, not yet switched plans.
+--
+  SELECT count(*) FROM (
+    WITH candidates AS (
+      SELECT
+        queryid, min_exec_time AS mit,
+		max_exec_time AS met,
+		mean_exec_time AS aet,
+	    mean_plan_time AS pt
+      FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1)
+	  USING (queryid)
+	  WHERE
+	    ref_exec_time IS NULL AND calls > ncalls AND mean_exec_time > 0.0 AND
+	    ((max_exec_time-min_exec_time)/mean_exec_time < 2.0 OR
+											total_exec_time < total_plan_time)
+    )
+    SELECT pg_mentor_set_plan_mode(candidates.queryid, 1, met) FROM candidates
+  ) INTO to_generic;
+
+--
+-- Action No.2:
+--
+
+  SELECT count(*) - to_generic FROM pg_mentor_show_prepared_statements(-1)
+  INTO unchanged;
 END;
 $$ LANGUAGE plpgsql;

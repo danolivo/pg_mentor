@@ -78,7 +78,7 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(4)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(5)
 
 typedef struct MentorTblEntry
 {
@@ -86,6 +86,8 @@ typedef struct MentorTblEntry
 	uint32		refcounter; /* How much users use this statement? */
 	int			plan_cache_mode;
 	TimestampTz	since; /* The moment of addition to the table */
+
+	double		ref_exec_time; /* execution time before the switch (or -1) */
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -131,6 +133,21 @@ set_plan_cache_mode(PreparedStatement  *entry, int status)
 		default:
 			Assert(0);
 	}
+}
+
+static int
+get_plan_cache_mode(PreparedStatement *ps)
+{
+	if (ps->plansource->cursor_options &
+							~(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN))
+		return 0; /* PLAN_CACHE_MODE_AUTO */
+	if (ps->plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
+		return 1; /* PLAN_CACHE_MODE_FORCE_GENERIC_PLAN */
+	if (ps->plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
+		return 2; /* PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN */
+
+	Assert(0);
+	return -1;
 }
 
 /*
@@ -283,6 +300,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 {
 	int64			queryId = PG_GETARG_INT64(0);
 	int				status = PG_GETARG_INT32(1);
+	double			ref_exec_time = PG_GETARG_FLOAT8(2);
 	bool			found;
 	MentorTblEntry *entry;
 	bool			result = false;
@@ -293,6 +311,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	if (!found || entry->plan_cache_mode != status)
 	{
 		entry->plan_cache_mode = status;
+		entry->ref_exec_time = ref_exec_time;
 		result = true;
 	}
 
@@ -306,6 +325,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 Datum
 pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 {
+	int					status = PG_GETARG_INT32(0);
 	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	dshash_seq_status	hash_seq;
 	MentorTblEntry	   *entry;
@@ -319,10 +339,19 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 	dshash_seq_init(&hash_seq, pgm_hash, false);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
+		/* Do we need to skip this record? */
+		if (status >= 0 && status != entry->plan_cache_mode)
+			continue;
+
+
 		values[0] = Int64GetDatumFast((int64) entry->queryid);
 		values[1] = UInt64GetDatum(entry->refcounter);
 		values[2] = Int32GetDatum(entry->plan_cache_mode);
 		values[3] = TimestampTzGetDatum(entry->since);
+		if (entry->ref_exec_time >= 0.0)
+			values[4] = Float8GetDatum(entry->ref_exec_time);
+		else
+			nulls[4] = true;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	dshash_seq_term(&hash_seq);
@@ -502,7 +531,7 @@ recreate_local_htab()
 }
 
 static uint32
-on_prepare(PreparedStatement  *ps)
+on_prepare(PreparedStatement *ps)
 {
 	uint64				queryId = get_prepared_stmt_queryId(ps);
 	MentorTblEntry	   *entry;
@@ -522,9 +551,9 @@ on_prepare(PreparedStatement  *ps)
 	{
 		/* Initialise new entry */
 		entry->refcounter = 1;
-		entry->plan_cache_mode = ps->plansource->cursor_options &
-							(CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_GENERIC_PLAN);
+		entry->plan_cache_mode = get_plan_cache_mode(ps);
 		entry->since = GetCurrentTimestamp();
+		entry->ref_exec_time = -1;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);

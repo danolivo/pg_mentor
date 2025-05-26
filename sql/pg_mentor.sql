@@ -51,6 +51,10 @@ EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- custom plan
 SELECT pg_mentor_set_plan_mode(:query_id, 0);
 EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- auto mode
 
+SELECT oid AS dboid FROM pg_database WHERE datname = current_database() \gset
+
+SELECT true FROM pg_stat_statements_reset(0, :dboid);
+
 -- Prepare the case when custom plan cost all the time much less than the
 -- generic one
 CREATE TABLE part (
@@ -80,11 +84,11 @@ EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry(1);
 
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
-SELECT pg_mentor_nail_long_planned();
+SELECT * FROM reconsider_ps_modes();
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
+SELECT * FROM reconsider_ps_modes(); -- and try again.
 
-SELECT refcounter,calls,plan_cache_mode,query
-FROM show_entries()
+SELECT refcounter,calls,plan_cache_mode,query FROM show_entries()
 ORDER BY md5(query);
 
 DEALLOCATE ALL;
