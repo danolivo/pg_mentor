@@ -1,3 +1,8 @@
+/*
+ * Test in this module is based on execution and planning time values. By
+ * default it may be unstable. We tune queries as much is possible to be stable.
+ * But still, don't care immediately, if results comparison is failed.
+ */
 CREATE EXTENSION pg_mentor CASCADE;
 
 CREATE FUNCTION show_entries()
@@ -86,10 +91,25 @@ EXECUTE qry(1);
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
 SELECT * FROM reconsider_ps_modes();
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
-SELECT * FROM reconsider_ps_modes(); -- and try again.
+SELECT * FROM reconsider_ps_modes(0, true); -- and try again, clear stat at the end.
 
-SELECT refcounter,calls,plan_cache_mode,query FROM show_entries()
-ORDER BY md5(query);
+CREATE TABLE part3 AS SELECT 201::int AS id
+FROM generate_series(1,1E4) AS x;
+VACUUM ANALYZE part3;
+ALTER TABLE part ATTACH PARTITION part3 FOR VALUES FROM (200) to (301);
+
+PREPARE qry1 (integer[]) AS SELECT * FROM part WHERE id = ANY ($1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,2]); -- good execution
+SELECT * FROM reconsider_ps_modes(); -- good to try generic plan mode
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]); -- one more good execution
+SELECT * FROM reconsider_ps_modes(); -- do not change previous decision
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,201]); --bad execution
+SELECT * FROM reconsider_ps_modes(); -- switch to custom plan node
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]); -- Must be custom plan
 
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;

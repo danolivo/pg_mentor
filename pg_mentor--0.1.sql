@@ -78,38 +78,59 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION reconsider_ps_modes(IN ncalls integer DEFAULT 0,
-    OUT to_generic integer,
-    OUT to_custom integer,
-    OUT unchanged integer
-)
+									IN reset_stat boolean DEFAULT false,
+									OUT to_generic bigint,
+									OUT to_custom bigint,
+									OUT unchanged bigint)
 RETURNS record AS $$
+DECLARE
+  dboid		Oid;
+  result	record;
 BEGIN
---
--- Action No.1:
--- Probe custom, not yet switched plans.
---
-  SELECT count(*) FROM (
-    WITH candidates AS (
-      SELECT
-        queryid, min_exec_time AS mit,
-		max_exec_time AS met,
-		mean_exec_time AS aet,
-	    mean_plan_time AS pt
-      FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1)
-	  USING (queryid)
-	  WHERE
-	    ref_exec_time IS NULL AND calls > ncalls AND mean_exec_time > 0.0 AND
-	    ((max_exec_time-min_exec_time)/mean_exec_time < 2.0 OR
+  WITH candidates_1 AS
+    -- 1. probe non-extension-forced custom plans
+    (SELECT queryid, total_exec_time AS tet
+    FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1)
+	USING (queryid)
+	WHERE
+	  calls > ncalls AND ref_exec_time IS NULL AND total_exec_time > 0.0 AND
+	  ((max_exec_time-min_exec_time)/total_exec_time < 2.0 OR
 											total_exec_time < total_plan_time)
-    )
-    SELECT pg_mentor_set_plan_mode(candidates.queryid, 1, met) FROM candidates
-  ) INTO to_generic;
+  ), candidates_2 AS (
+    -- 2. detect unsuccessful 'to generic' switches
+    SELECT queryid, total_exec_time AS tet
+    FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
+	USING (queryid)
+	WHERE
+      -- Basic filters
+      calls > ncalls AND
+      -- Avoid dummy decisions
+      total_exec_time > total_plan_time AND
+      -- The action 2 filters
+      ps.plan_cache_mode = 1 AND
+      ref_exec_time > 0.0 AND total_exec_time/ref_exec_time > 2.0
+  )
+  -- Switch query plan mode in the global hash table
+  SELECT q1.to_generic, q2.to_custom, q3.unchanged FROM (
+    (SELECT count(*) AS to_generic FROM
+      (SELECT pg_mentor_set_plan_mode(queryid, 1, tet) FROM candidates_1)
+    ) q1 JOIN
+    (SELECT count(*) AS to_custom FROM
+      (SELECT pg_mentor_set_plan_mode(queryid, 2, tet) FROM candidates_2)
+    ) q2 JOIN LATERAL
+    (SELECT x - q2.to_custom - q1.to_generic AS unchanged FROM
+      (SELECT count(*) AS x FROM pg_mentor_show_prepared_statements(-1))) q3
+    ON true ON true) INTO result;
 
---
--- Action No.2:
---
+  to_generic := result.to_generic;
+  to_custom := result.to_custom;
+  unchanged := result.unchanged;
 
-  SELECT count(*) - to_generic FROM pg_mentor_show_prepared_statements(-1)
-  INTO unchanged;
+  -- Cleanup statistics related to current database, if requested.
+  IF reset_stat THEN
+    SELECT oid AS dboid FROM pg_database
+	WHERE datname = current_database() INTO dboid;
+	PERFORM pg_stat_statements_reset(0, dboid);
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
