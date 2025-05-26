@@ -308,12 +308,9 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	pgm_init_shmem();
 
 	entry = (MentorTblEntry *) dshash_find_or_insert(pgm_hash, &queryId, &found);
-	if (!found || entry->plan_cache_mode != status)
-	{
-		entry->plan_cache_mode = status;
-		entry->ref_exec_time = ref_exec_time;
-		result = true;
-	}
+	entry->plan_cache_mode = status;
+	entry->ref_exec_time = ref_exec_time;
+	result = true;
 
 	dshash_release_lock(pgm_hash, entry);
 	/* Tell other backends that they may update their statuses. */
@@ -329,8 +326,6 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	dshash_seq_status	hash_seq;
 	MentorTblEntry	   *entry;
-	Datum				values[MENTOR_TBL_ENTRY_FIELDS_NUM];
-	bool				nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
 
 	pgm_init_shmem();
 
@@ -339,10 +334,12 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 	dshash_seq_init(&hash_seq, pgm_hash, false);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
+		Datum	values[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
+		bool	nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
+
 		/* Do we need to skip this record? */
 		if (status >= 0 && status != entry->plan_cache_mode)
 			continue;
-
 
 		values[0] = Int64GetDatumFast((int64) entry->queryid);
 		values[1] = UInt64GetDatum(entry->refcounter);
@@ -352,6 +349,7 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 			values[4] = Float8GetDatum(entry->ref_exec_time);
 		else
 			nulls[4] = true;
+
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	dshash_seq_term(&hash_seq);
@@ -553,7 +551,7 @@ on_prepare(PreparedStatement *ps)
 		entry->refcounter = 1;
 		entry->plan_cache_mode = get_plan_cache_mode(ps);
 		entry->since = GetCurrentTimestamp();
-		entry->ref_exec_time = -1;
+		entry->ref_exec_time = -1.0;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);
