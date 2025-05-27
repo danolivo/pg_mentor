@@ -313,14 +313,95 @@ EXECUTE qry2(1);
 (4 rows)
 
 -- change qry1 and qry2 plan cache modes to custom.
-SELECT * FROM reconsider_ps_modes();
+SELECT * FROM reconsider_ps_modes(0, true);
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         2 |         5
 (1 row)
 
+-- Do a series of executions that have similar execution tim to decide that
+-- it is stable enough to go generic.
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]); -- Must be custom plan
+EXECUTE qry2(1); -- Must be custom plan
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
+   Index Cond: (id < 1)
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
+   Index Cond: (id < 1)
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
+   Index Cond: (id < 1)
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
+   Index Cond: (id = ANY ('{1,3}'::integer[]))
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
+   Index Cond: (id = ANY ('{1,3}'::integer[]))
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
+   Index Cond: (id = ANY ('{1,3}'::integer[]))
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+-- Nothing changes, switch back to generic plan for qry2 and don't change qry1.
+SELECT * FROM reconsider_ps_modes(0, true);
+ to_generic | to_custom | unchanged 
+------------+-----------+-----------
+          1 |         0 |         6
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1); -- must be generic
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Append (actual rows=50.00 loops=1)
+   Subplans Removed: 2
+   ->  Index Only Scan using part1_id_idx2 on part1 part_1 (actual rows=50.00 loops=1)
+         Index Cond: (id < $1)
+         Heap Fetches: 0
+         Index Searches: 1
+(6 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]); -- must be custom
                                    QUERY PLAN                                   
 --------------------------------------------------------------------------------
  Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
