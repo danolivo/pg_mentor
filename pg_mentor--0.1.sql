@@ -32,7 +32,8 @@ LANGUAGE C;
 --
 CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint,
 										status integer,
-										ref_exec_time float8 DEFAULT -1)
+										ref_exec_time float8 DEFAULT -1,
+										fixed bool DEFAULT false)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
 LANGUAGE C;
@@ -48,7 +49,8 @@ CREATE FUNCTION pg_mentor_show_prepared_statements(
   OUT refcounter integer,
   OUT plan_cache_mode int,
   OUT since TimestampTz,
-  OUT ref_exec_time	float8)
+  OUT ref_exec_time	float8,
+  OUT fixed boolean)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;
@@ -118,13 +120,24 @@ BEGIN
 	  ps.plan_cache_mode < 1 AND total_exec_time > total_plan_time * 2.0 AND
 	  (max_exec_time-min_exec_time)/mean_exec_time > 2.0
   )
+  , candidates_4 AS (
+	-- 4. detect unsuccessful 'to custom' switches
+	SELECT queryid, total_exec_time AS tet
+    FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
+	USING (queryid)
+	WHERE
+      calls > ncalls AND ref_exec_time > 0.0 AND not fixed AND
+	  ps.plan_cache_mode = 2 AND total_exec_time/ref_exec_time < 2.0
+  )
   -- Switch query plan mode in the global hash table
   SELECT q1.to_generic, q2.to_custom, q3.unchanged FROM (
-    (SELECT count(*) AS to_generic FROM
-      (SELECT pg_mentor_set_plan_mode(queryid, 1, tet) FROM candidates_1)
+    (SELECT count(*) AS to_generic FROM (
+	  SELECT pg_mentor_set_plan_mode(queryid, 1, tet) FROM candidates_1
+	    UNION ALL
+	  SELECT pg_mentor_set_plan_mode(queryid, 1, tet) FROM candidates_4)
     ) q1 JOIN
     (SELECT count(*) AS to_custom FROM (
-	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet) FROM candidates_2
+	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet, true) FROM candidates_2
 	    UNION ALL
 	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet) FROM candidates_3)
     ) q2 JOIN LATERAL

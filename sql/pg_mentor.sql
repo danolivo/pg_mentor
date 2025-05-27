@@ -124,10 +124,28 @@ EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry2(1);
 
 -- change qry1 and qry2 plan cache modes to custom.
-SELECT * FROM reconsider_ps_modes();
+SELECT * FROM reconsider_ps_modes(0, true);
 
+-- Do a series of executions that have similar execution tim to decide that
+-- it is stable enough to go generic.
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]); -- Must be custom plan
+EXECUTE qry2(1); -- Must be custom plan
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+-- Nothing changes, switch back to generic plan for qry2 and don't change qry1.
+SELECT * FROM reconsider_ps_modes(0, true);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1); -- must be generic
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]); -- must be custom
 
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;

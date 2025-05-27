@@ -78,7 +78,7 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(5)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(6)
 
 typedef struct MentorTblEntry
 {
@@ -88,6 +88,7 @@ typedef struct MentorTblEntry
 	TimestampTz	since; /* The moment of addition to the table */
 
 	double		ref_exec_time; /* execution time before the switch (or -1) */
+	bool		fixed; /* May it be changed automatically? */
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -301,6 +302,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	int64			queryId = PG_GETARG_INT64(0);
 	int				status = PG_GETARG_INT32(1);
 	double			ref_exec_time = PG_GETARG_FLOAT8(2);
+	bool			fixed = PG_GETARG_BOOL(3);
 	bool			found;
 	MentorTblEntry *entry;
 	bool			result = false;
@@ -310,6 +312,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	entry = (MentorTblEntry *) dshash_find_or_insert(pgm_hash, &queryId, &found);
 	entry->plan_cache_mode = status;
 	entry->ref_exec_time = ref_exec_time;
+	entry->fixed = fixed;
 	result = true;
 
 	dshash_release_lock(pgm_hash, entry);
@@ -349,6 +352,7 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 			values[4] = Float8GetDatum(entry->ref_exec_time);
 		else
 			nulls[4] = true;
+		values[5] = BoolGetDatum(entry->fixed);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
