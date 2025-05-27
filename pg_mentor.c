@@ -376,9 +376,12 @@ pg_mentor_reset(PG_FUNCTION_ARGS)
 	dshash_seq_init(&hash_seq, pgm_hash, true);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
-		if (entry->plan_cache_mode != 0)
+		if (entry->plan_cache_mode > 0)
 		{
 			entry->plan_cache_mode = 0;
+			entry->fixed = false;
+			entry->ref_exec_time = -1;
+			entry->since = 0;
 			counter++;
 		}
 	}
