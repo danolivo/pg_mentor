@@ -78,18 +78,20 @@ PREPARE qry (integer) AS SELECT * FROM part WHERE id IN ($1, $1+1);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry(1);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry(1);
+EXECUTE qry(2);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry(1);
+EXECUTE qry(3);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry(1);
+EXECUTE qry(4);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry(1);
+EXECUTE qry(5);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry(1);
+EXECUTE qry(6);
 
-EXPLAIN (COSTS OFF) EXECUTE qry(1); -- it uses custom plan yet
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry(1); -- it uses custom plan yet
 SELECT * FROM reconsider_ps_modes();
+
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
 SELECT * FROM reconsider_ps_modes(0, true); -- and try again, clear stat at the end.
 
@@ -99,15 +101,31 @@ VACUUM ANALYZE part3;
 ALTER TABLE part ATTACH PARTITION part3 FOR VALUES FROM (200) to (301);
 
 PREPARE qry1 (integer[]) AS SELECT * FROM part WHERE id = ANY ($1);
+-- Step 3: should be bad because sometimes we return single tuple but sometimes
+-- multiple tuples. Planning is quick enough.
+PREPARE qry2 (integer) AS SELECT * FROM part WHERE id < $1;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(210);
+
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,2]); -- good execution
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,2]); -- need another one to not decide on a single shot
 SELECT * FROM reconsider_ps_modes(); -- good to try generic plan mode
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(110);
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,3]); -- one more good execution
 SELECT * FROM reconsider_ps_modes(); -- do not change previous decision
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,201]); --bad execution
-SELECT * FROM reconsider_ps_modes(); -- switch to custom plan node
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+
+-- change qry1 and qry2 plan cache modes to custom.
+SELECT * FROM reconsider_ps_modes();
+
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,3]); -- Must be custom plan
 
