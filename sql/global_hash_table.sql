@@ -16,7 +16,7 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 -- Should show nothing. XXX: parallel tests may interfere here.
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 -- Dummy test on redundant deallocation
 PREPARE stmt0(int) AS SELECT $1+random() AS x;
@@ -26,33 +26,33 @@ PREPARE stmt2(int,int) AS SELECT sqrt($1+$2) AS x;
 EXECUTE stmt0(1) \gset
 EXECUTE stmt1(1,2) \gset
 EXECUTE stmt2(3,4) \gset
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 DEALLOCATE stmt0;
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 DEALLOCATE stmt0;
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 DEALLOCATE ALL;
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 DEALLOCATE ALL;
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 -- Prepare statements before the exit
 PREPARE stmt1(int,int) AS SELECT $1+$2;
 PREPARE stmt2(int,int) AS SELECT sqrt($1+$2);
 -- see couple of used entries
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 SELECT current_database() AS dbname \gset
 
 -- Let's open a new connection and see what we can find there
 \c :dbname
 -- exiting, backend cleans its refcounters - all the entries should be zeroed
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 PREPARE stmt0(int) AS SELECT $1+random();
 -- Check that the entry will be reused
-SELECT * FROM show_entries() ORDER BY md5(query);
+SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 
 DEALLOCATE ALL;
 DROP FUNCTION show_entries();
