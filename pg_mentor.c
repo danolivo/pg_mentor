@@ -235,10 +235,10 @@ typedef struct LocaLPSEntry
 static void
 check_state(void)
 {
-	dshash_seq_status hash_seq;
-	uint64			generation;
-	MentorTblEntry *entry;
-	List		   *pslst;
+	dshash_seq_status	hash_seq;
+	uint64				generation;
+	MentorTblEntry	   *entry;
+	List			   *pslst;
 
 	generation = pg_atomic_read_u64(&state->state_decisions);
 
