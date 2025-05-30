@@ -1,15 +1,18 @@
 CREATE EXTENSION pg_mentor CASCADE;
 SELECT 1 AS noname FROM pg_mentor_reset();
 
+-- Show stable (architecture-independent) parameters of the entry and
+-- its statistics
 CREATE FUNCTION show_entries()
 RETURNS TABLE (
   refcounter		integer,
   plan_cache_mode	integer,
+  statnum			integer,
   query				text
 )  AS $$
 BEGIN
   RETURN QUERY
-    SELECT p.refcounter,p.plan_cache_mode,s.query
+    SELECT p.refcounter,p.plan_cache_mode,p.statnum,s.query
     FROM pg_mentor_show_prepared_statements(-1) p JOIN
 	  pg_stat_statements s USING (queryid);
 END;
@@ -50,9 +53,39 @@ SELECT current_database() AS dbname \gset
 \c :dbname
 -- exiting, backend cleans its refcounters - all the entries should be zeroed
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
-PREPARE stmt0(int) AS SELECT $1+random();
+PREPARE stmt0(int) AS SELECT $1+random() AS x;
 -- Check that the entry will be reused
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
+
+-- Basically, we want to see how ring buffer works. In this example we don't
+-- have any reason to touch disk blocks during planning or execution phases.
+-- But it is still not a 100% guarantee of stability.
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%+random()%';
+EXECUTE stmt0(1) \gset
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%\+random()%';
+ \o /dev/null
+EXECUTE stmt0(1) \watch i=0 c=100
+\o
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%\+random()%';
+
+-- Warm-up planner caches
+SELECT oid FROM pg_class WHERE oid = 2966;
+-- Not sure how stable it is, but seems pretty good if nothing in index scan
+-- logic will be changed.
+PREPARE stmt1(Oid) AS SELECT oid FROM pg_class WHERE oid = $1;
+ \o /dev/null
+EXECUTE stmt1(2966) \watch i=0 c=5
+\o
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%pg_class%';
+
 
 DEALLOCATE ALL;
 DROP FUNCTION show_entries();

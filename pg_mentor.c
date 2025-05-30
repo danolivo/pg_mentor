@@ -78,7 +78,8 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(6)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(8)
+#define MENTOR_TBL_ENTRY_STAT_SIZE	(100)
 
 typedef struct MentorTblEntry
 {
@@ -89,6 +90,10 @@ typedef struct MentorTblEntry
 
 	double		ref_exec_time; /* execution time before the switch (or -1) */
 	bool		fixed; /* May it be changed automatically? */
+
+	/* Statistics */
+	uint64		nblocks[MENTOR_TBL_ENTRY_STAT_SIZE];
+	int			next_idx;
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -322,6 +327,30 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(result);
 }
 
+static int
+ring_buffer_size(MentorTblEntry *entry)
+{
+	if (unlikely(entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] == UINT64_MAX))
+		return entry->next_idx;
+	else
+		return MENTOR_TBL_ENTRY_STAT_SIZE;
+}
+
+static ArrayType *
+form_vector(uint64 *vector, int nrows)
+{
+	Datum	   *elems;
+	ArrayType  *a;
+	int			lbs = 1;
+	int			i;
+
+	elems = palloc(sizeof(*elems) * nrows);
+	for (i = 0; i < nrows; i++)
+		elems[i] = UInt64GetDatum(vector[i]);
+	a = construct_md_array(elems, NULL, 1, &nrows, &lbs, INT8OID, 8, true, 'd');
+	return a;
+}
+
 Datum
 pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 {
@@ -339,6 +368,7 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 	{
 		Datum	values[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
 		bool	nulls[MENTOR_TBL_ENTRY_FIELDS_NUM] = {0};
+		int		statnum;
 
 		/* Do we need to skip this record? */
 		if (status >= 0 && status != entry->plan_cache_mode)
@@ -353,6 +383,10 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 		else
 			nulls[4] = true;
 		values[5] = BoolGetDatum(entry->fixed);
+
+		statnum = ring_buffer_size(entry);
+		values[6] = statnum;
+		values[7] = PointerGetDatum(form_vector(entry->nblocks, statnum));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -554,11 +588,16 @@ on_prepare(PreparedStatement *ps)
 		entry->refcounter++;
 	else
 	{
+		int i;
+
 		/* Initialise new entry */
 		entry->refcounter = 1;
 		entry->plan_cache_mode = get_plan_cache_mode(ps);
 		entry->since = GetCurrentTimestamp();
 		entry->ref_exec_time = -1.0;
+		entry->next_idx = 0;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->nblocks[i] = UINT64_MAX;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);
@@ -664,6 +703,28 @@ on_deallocate(uint64 queryId)
 }
 
 static void
+on_execute(uint64 queryId, BufferUsage *bufusage)
+{
+	MentorTblEntry	   *entry;
+	uint64				nblocks;
+
+	if (queryId == UINT64CONST(0))
+		return;
+
+	nblocks = bufusage->shared_blks_hit + bufusage->shared_blks_read +
+				bufusage->local_blks_hit +bufusage->local_blks_read +
+				bufusage->temp_blks_read;
+
+	entry = (MentorTblEntry *) dshash_find(pgm_hash, &queryId, true);
+	Assert(entry != NULL);
+
+	entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] = nblocks;
+	entry->next_idx++;
+
+	dshash_release_lock(pgm_hash, entry);
+}
+
+static void
 call_process_utility_chain(PlannedStmt *pstmt, const char *queryString,
 						bool readOnlyTree, ProcessUtilityContext context,
 						ParamListInfo params, QueryEnvironment *queryEnv,
@@ -702,9 +763,10 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 						ParamListInfo params, QueryEnvironment *queryEnv,
 						DestReceiver *dest, QueryCompletion *qc)
 {
-	Node   *parsetree = pstmt->utilityStmt;
-	uint64	queryId = UINT64CONST(0);
-	bool	deallocate_all = false;
+	Node	   *parsetree = pstmt->utilityStmt;
+	uint64		queryId = UINT64CONST(0);
+	bool		deallocate_all = false;
+	BufferUsage	bufusage_start, bufusage;
 
 	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
 	{
@@ -738,6 +800,11 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 		else
 			deallocate_all = true;
 	}
+	else if (IsA(parsetree, ExecuteStmt))
+	{
+		/* Do measurements */
+		bufusage_start = pgBufferUsage;
+	}
 
 	/* Let the core to execute command before the further operations */
 	call_process_utility_chain(pstmt, queryString, readOnlyTree,
@@ -763,6 +830,29 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 		{
 			if (queryId != UINT64CONST(0) || deallocate_all)
 				on_deallocate(queryId);
+		}
+			break;
+		case T_ExecuteStmt:
+		{
+			ExecuteStmt		   *es = (ExecuteStmt *) parsetree;
+			PreparedStatement  *ps = FetchPreparedStatement(es->name, true);
+			uint64				queryId;
+
+			queryId = (ps == NULL) ?	UINT64CONST(0) :
+										get_prepared_stmt_queryId(ps);
+
+			if (queryId == UINT64CONST(0))
+				break;
+
+			/*
+			 * Store statistics needed to decide plan_cache_mode switching.
+			 * Here we also include number of blocks, read on planning. Remember
+			 * sometimes planner touch index blocks it seems not ideal.
+			 */
+			memset(&bufusage, 0, sizeof(BufferUsage));
+			BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
+
+			on_execute(queryId, &bufusage);
 		}
 			break;
 		default:

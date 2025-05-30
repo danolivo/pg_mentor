@@ -50,7 +50,9 @@ CREATE FUNCTION pg_mentor_show_prepared_statements(
   OUT plan_cache_mode int,
   OUT since TimestampTz,
   OUT ref_exec_time	float8,
-  OUT fixed boolean)
+  OUT fixed boolean,
+  OUT statnum integer,
+  OUT nblocks bigint[])
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;

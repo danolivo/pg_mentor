@@ -180,7 +180,7 @@ EXECUTE qry(1); -- it uses custom plan yet
 SELECT * FROM reconsider_ps_modes();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          1 |         0 |         4
+          1 |         0 |         5
 (1 row)
 
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
@@ -195,7 +195,7 @@ EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
 SELECT * FROM reconsider_ps_modes(0, true); -- and try again, clear stat at the end.
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          0 |         0 |         5
+          0 |         0 |         6
 (1 row)
 
 CREATE TABLE part3 AS SELECT 201::int AS id
@@ -242,7 +242,7 @@ EXECUTE qry1(ARRAY[1,2]); -- need another one to not decide on a single shot
 SELECT * FROM reconsider_ps_modes(); -- good to try generic plan mode
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          1 |         0 |         6
+          1 |         0 |         7
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
@@ -280,7 +280,7 @@ EXECUTE qry1(ARRAY[1,3]); -- one more good execution
 SELECT * FROM reconsider_ps_modes(); -- do not change previous decision
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          0 |         0 |         7
+          0 |         0 |         8
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
@@ -316,7 +316,7 @@ EXECUTE qry2(1);
 SELECT * FROM reconsider_ps_modes(0, true);
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          0 |         2 |         5
+          0 |         2 |         6
 (1 row)
 
 -- Do a series of executions that have similar execution tim to decide that
@@ -385,7 +385,7 @@ EXECUTE qry1(ARRAY[1,3]);
 SELECT * FROM reconsider_ps_modes(0, true);
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
-          1 |         0 |         6
+          1 |         0 |         7
 (1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)

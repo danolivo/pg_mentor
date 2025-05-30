@@ -6,23 +6,26 @@ SELECT 1 AS noname FROM pg_mentor_reset();
       1
 (1 row)
 
+-- Show stable (architecture-independent) parameters of the entry and
+-- its statistics
 CREATE FUNCTION show_entries()
 RETURNS TABLE (
   refcounter		integer,
   plan_cache_mode	integer,
+  statnum			integer,
   query				text
 )  AS $$
 BEGIN
   RETURN QUERY
-    SELECT p.refcounter,p.plan_cache_mode,s.query
+    SELECT p.refcounter,p.plan_cache_mode,p.statnum,s.query
     FROM pg_mentor_show_prepared_statements(-1) p JOIN
 	  pg_stat_statements s USING (queryid);
 END;
 $$ LANGUAGE PLPGSQL;
 -- Should show nothing. XXX: parallel tests may interfere here.
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode | query 
-------------+-----------------+-------
+ refcounter | plan_cache_mode | statnum | query 
+------------+-----------------+---------+-------
 (0 rows)
 
 -- Dummy test on redundant deallocation
@@ -34,48 +37,48 @@ EXECUTE stmt0(1) \gset
 EXECUTE stmt1(1,2) \gset
 EXECUTE stmt2(3,4) \gset
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          1 |               0 | SELECT $1+$2 AS x
-          1 |               0 | SELECT $1+random() AS x
-          1 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          1 |               0 |       1 | SELECT $1+$2 AS x
+          1 |               0 |       1 | SELECT $1+random() AS x
+          1 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 DEALLOCATE stmt0;
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          1 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          1 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          1 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          1 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 DEALLOCATE stmt0;
 ERROR:  prepared statement "stmt0" does not exist
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          1 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          1 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          1 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          1 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 DEALLOCATE ALL;
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          0 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          0 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          0 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          0 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 DEALLOCATE ALL;
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          0 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          0 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          0 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          0 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 -- Prepare statements before the exit
@@ -83,11 +86,11 @@ PREPARE stmt1(int,int) AS SELECT $1+$2;
 PREPARE stmt2(int,int) AS SELECT sqrt($1+$2);
 -- see couple of used entries
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          1 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          1 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          1 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          1 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
 SELECT current_database() AS dbname \gset
@@ -95,22 +98,76 @@ SELECT current_database() AS dbname \gset
 \c :dbname
 -- exiting, backend cleans its refcounters - all the entries should be zeroed
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          0 |               0 | SELECT $1+$2 AS x
-          0 |               0 | SELECT $1+random() AS x
-          0 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          0 |               0 |       1 | SELECT $1+$2 AS x
+          0 |               0 |       1 | SELECT $1+random() AS x
+          0 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
 
-PREPARE stmt0(int) AS SELECT $1+random();
+PREPARE stmt0(int) AS SELECT $1+random() AS x;
 -- Check that the entry will be reused
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
- refcounter | plan_cache_mode |          query          
-------------+-----------------+-------------------------
-          0 |               0 | SELECT $1+$2 AS x
-          1 |               0 | SELECT $1+random() AS x
-          0 |               0 | SELECT sqrt($1+$2) AS x
+ refcounter | plan_cache_mode | statnum |          query          
+------------+-----------------+---------+-------------------------
+          0 |               0 |       1 | SELECT $1+$2 AS x
+          1 |               0 |       1 | SELECT $1+random() AS x
+          0 |               0 |       1 | SELECT sqrt($1+$2) AS x
 (3 rows)
+
+-- Basically, we want to see how ring buffer works. In this example we don't
+-- have any reason to touch disk blocks during planning or execution phases.
+-- But it is still not a 100% guarantee of stability.
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%+random()%';
+ refcounter | plan_cache_mode | statnum | nblocks |          query          
+------------+-----------------+---------+---------+-------------------------
+          1 |               0 |       1 | {0}     | SELECT $1+random() AS x
+(1 row)
+
+EXECUTE stmt0(1) \gset
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%\+random()%';
+ refcounter | plan_cache_mode | statnum | nblocks |          query          
+------------+-----------------+---------+---------+-------------------------
+          1 |               0 |       2 | {0,0}   | SELECT $1+random() AS x
+(1 row)
+
+ \o /dev/null
+EXECUTE stmt0(1) \watch i=0 c=100
+
+\o
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%\+random()%';
+ refcounter | plan_cache_mode | statnum |                                                                                                  nblocks                                                                                                  |          query          
+------------+-----------------+---------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------------
+          1 |               0 |     100 | {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} | SELECT $1+random() AS x
+(1 row)
+
+-- Warm-up planner caches
+SELECT oid FROM pg_class WHERE oid = 2966;
+ oid  
+------
+ 2966
+(1 row)
+
+-- Not sure how stable it is, but seems pretty good if nothing in index scan
+-- logic will be changed.
+PREPARE stmt1(Oid) AS SELECT oid FROM pg_class WHERE oid = $1;
+ \o /dev/null
+EXECUTE stmt1(2966) \watch i=0 c=5
+
+\o
+SELECT p.refcounter,p.plan_cache_mode,p.statnum,p.nblocks,s.query
+FROM pg_mentor_show_prepared_statements(-1) p
+JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%pg_class%';
+ refcounter | plan_cache_mode | statnum |   nblocks   |                  query                  
+------------+-----------------+---------+-------------+-----------------------------------------
+          1 |               0 |       5 | {3,3,3,3,3} | SELECT oid FROM pg_class WHERE oid = $1
+(1 row)
 
 DEALLOCATE ALL;
 DROP FUNCTION show_entries();
