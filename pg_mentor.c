@@ -55,6 +55,10 @@ static Oid		   psfuncoid = 0;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 /*
  * Single flag for all databases?
@@ -766,7 +770,6 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 	Node	   *parsetree = pstmt->utilityStmt;
 	uint64		queryId = UINT64CONST(0);
 	bool		deallocate_all = false;
-	BufferUsage	bufusage_start, bufusage;
 
 	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
 	{
@@ -800,11 +803,6 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 		else
 			deallocate_all = true;
 	}
-	else if (IsA(parsetree, ExecuteStmt))
-	{
-		/* Do measurements */
-		bufusage_start = pgBufferUsage;
-	}
 
 	/* Let the core to execute command before the further operations */
 	call_process_utility_chain(pstmt, queryString, readOnlyTree,
@@ -832,32 +830,106 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 				on_deallocate(queryId);
 		}
 			break;
-		case T_ExecuteStmt:
-		{
-			ExecuteStmt		   *es = (ExecuteStmt *) parsetree;
-			PreparedStatement  *ps = FetchPreparedStatement(es->name, true);
-			uint64				queryId;
-
-			queryId = (ps == NULL) ?	UINT64CONST(0) :
-										get_prepared_stmt_queryId(ps);
-
-			if (queryId == UINT64CONST(0))
-				break;
-
-			/*
-			 * Store statistics needed to decide plan_cache_mode switching.
-			 * Here we also include number of blocks, read on planning. Remember
-			 * sometimes planner touch index blocks it seems not ideal.
-			 */
-			memset(&bufusage, 0, sizeof(BufferUsage));
-			BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
-
-			on_execute(queryId, &bufusage);
-		}
-			break;
 		default:
 			break;
 	}
+}
+
+static int	nesting_level = 0;
+#include "access/parallel.h"
+
+#define pgm_enabled(level) \
+	(!IsParallelWorker() && (level) == 0)
+
+static void
+pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	uint64		queryId = queryDesc->plannedstmt->queryId;
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+
+	if (pgm_enabled(nesting_level) && queryId != UINT64CONST(0))
+	{
+		bool			found;
+
+		/* Be gentle and track queries are known as prepared statements */
+		(void) hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
+		if (!found)
+			return;
+
+		if (queryDesc->totaltime == NULL)
+		{
+			MemoryContext oldcxt;
+
+			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_BUFFERS, false);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
+}
+
+static void
+pgm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	nesting_level++;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		nesting_level--;
+	}
+	PG_END_TRY();
+}
+
+static void
+pgm_ExecutorFinish(QueryDesc *queryDesc)
+{
+	nesting_level++;
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_FINALLY();
+	{
+		nesting_level--;
+	}
+	PG_END_TRY();
+}
+
+static void
+pgm_ExecutorEnd(QueryDesc *queryDesc)
+{
+	uint64		queryId = queryDesc->plannedstmt->queryId;
+
+	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
+		pgm_enabled(nesting_level))
+	{
+		bool	found;
+
+		(void) hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
+		if (found)
+		{
+			InstrEndLoop(queryDesc->totaltime);
+
+			on_execute(queryId, &queryDesc->totaltime->bufusage);
+		}
+	}
+
+	if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
 }
 
 void
@@ -873,6 +945,14 @@ _PG_init(void)
 	planner_hook = pgm_planner;
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = pgm_ProcessUtility_hook;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = pgm_ExecutorStart;
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = pgm_ExecutorRun;
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = pgm_ExecutorFinish;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = pgm_ExecutorEnd;
 
 	recreate_local_htab();
 

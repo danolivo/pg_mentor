@@ -96,11 +96,12 @@ BEGIN
     SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
-	WHERE calls > 1 AND
+	WHERE ps.statnum > 1 AND
 	  calls > ncalls AND ref_exec_time IS NULL AND
 	  ps.plan_cache_mode < 1 AND total_exec_time <= total_plan_time * 2.0 AND
 	  total_exec_time > 0.0 AND
-	  (max_exec_time-min_exec_time)/mean_exec_time <= 2.0
+	  (SELECT avg(arr) FROM unnest(ps.nblocks) arr) > 0.0 AND
+	  (SELECT (max(arr)-min(arr))/avg(arr) FROM unnest(ps.nblocks) arr) <= 2.0
   ), candidates_2 AS (
     -- 2. detect unsuccessful 'to generic' switches
     SELECT queryid, total_exec_time AS tet
@@ -117,10 +118,11 @@ BEGIN
 	SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
-	WHERE calls > 1 AND
+	WHERE ps.statnum > 1 AND
       calls > ncalls AND ref_exec_time IS NULL AND
 	  ps.plan_cache_mode < 1 AND total_exec_time > total_plan_time * 2.0 AND
-	  (max_exec_time-min_exec_time)/mean_exec_time > 2.0
+	  (SELECT avg(arr) FROM unnest(ps.nblocks) arr) > 0.0 AND
+	  (SELECT (max(arr)-min(arr))/avg(arr) FROM unnest(ps.nblocks) arr) > 2.0
   )
   , candidates_4 AS (
 	-- 4. detect unsuccessful 'to custom' switches
