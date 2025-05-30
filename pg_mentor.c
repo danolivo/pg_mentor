@@ -805,6 +805,13 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 		/* Do measurements */
 		bufusage_start = pgBufferUsage;
 	}
+	else if (IsA(parsetree, ExplainStmt))
+	{
+		ExplainStmt * stmt = (ExplainStmt *) parsetree;
+
+		if (IsA(stmt->query, ExecuteStmt))
+			bufusage_start = pgBufferUsage;
+	}
 
 	/* Let the core to execute command before the further operations */
 	call_process_utility_chain(pstmt, queryString, readOnlyTree,
@@ -832,6 +839,14 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 				on_deallocate(queryId);
 		}
 			break;
+		case T_ExplainStmt:
+		{
+			ExplainStmt * stmt = (ExplainStmt *) parsetree;
+
+			if (!IsA(stmt->query, ExecuteStmt))
+				break;
+			parsetree = stmt->query;
+		}
 		case T_ExecuteStmt:
 		{
 			ExecuteStmt		   *es = (ExecuteStmt *) parsetree;
