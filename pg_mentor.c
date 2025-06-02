@@ -97,8 +97,12 @@ typedef struct MentorTblEntry
 
 	/* Statistics */
 	int64		nblocks[MENTOR_TBL_ENTRY_STAT_SIZE];
+	double		times[MENTOR_TBL_ENTRY_STAT_SIZE];
 	int			next_idx;
+	double		average;
 	int64		ref_nblocks;
+
+	double		avg_time;
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -328,8 +332,6 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 		entry->ref_nblocks = ref_nblocks;
 	else
 	{
-		int	i;
-
 		if (entry->nblocks[0] < 0)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("ref_nblocks cannot be null for never executed query")));
@@ -337,14 +339,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 		/*
 		 * Calculate average number of blocks, used by queries with this queryId
 		 */
-		ref_nblocks = 0;
-		for(i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
-		{
-			if (entry->nblocks[i] < 0)
-				break;
-			ref_nblocks += entry->nblocks[i];
-		}
-		ref_nblocks /= i;
+		ref_nblocks = entry->average;
 	}
 
 	result = true;
@@ -635,6 +630,8 @@ on_prepare(PreparedStatement *ps)
 		entry->ref_exec_time = -1.0;
 		entry->next_idx = 0;
 		entry->ref_nblocks = -1;
+		entry->average = 0;
+		entry->avg_time = 0;
 		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
 			entry->nblocks[i] = -1;
 	}
@@ -742,7 +739,7 @@ on_deallocate(uint64 queryId)
 }
 
 static void
-on_execute(uint64 queryId, BufferUsage *bufusage)
+on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
 {
 	MentorTblEntry	   *entry;
 	int64				nblocks;
@@ -756,8 +753,31 @@ on_execute(uint64 queryId, BufferUsage *bufusage)
 
 	entry = (MentorTblEntry *) dshash_find(pgm_hash, &queryId, true);
 	Assert(entry != NULL);
+	Assert(ring_buffer_size(entry) <= MENTOR_TBL_ENTRY_STAT_SIZE);
+
+	/*
+	 * Calculate statistics. Be careful - in case of massive ring buffer
+	 * computation on each execution may become costly.
+	 */
+	if (ring_buffer_size(entry) == MENTOR_TBL_ENTRY_STAT_SIZE)
+	{
+		entry->average +=
+				(-entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] +
+										nblocks) / MENTOR_TBL_ENTRY_STAT_SIZE;
+		entry->avg_time +=
+				(-entry->times[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] +
+										exec_time) / MENTOR_TBL_ENTRY_STAT_SIZE;
+	}
+	else
+	{
+		entry->average = (entry->average * entry->next_idx + nblocks) /
+														(entry->next_idx + 1);
+		entry->avg_time = (entry->avg_time * entry->next_idx + exec_time) /
+														(entry->next_idx + 1);
+	}
 
 	entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] = nblocks;
+	entry->times[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] = exec_time;
 	entry->next_idx++;
 
 	dshash_release_lock(pgm_hash, entry);
@@ -900,7 +920,8 @@ pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			MemoryContext oldcxt;
 
 			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_BUFFERS, false);
+			queryDesc->totaltime =
+					InstrAlloc(1, INSTRUMENT_BUFFERS | INSTRUMENT_TIMER, false);
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
@@ -957,7 +978,8 @@ pgm_ExecutorEnd(QueryDesc *queryDesc)
 		{
 			InstrEndLoop(queryDesc->totaltime);
 
-			on_execute(queryId, &queryDesc->totaltime->bufusage);
+			on_execute(queryId, &queryDesc->totaltime->bufusage,
+					   queryDesc->totaltime->total * 1000.0);
 		}
 	}
 
