@@ -82,8 +82,8 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(8)
-#define MENTOR_TBL_ENTRY_STAT_SIZE	(100)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(9)
+#define MENTOR_TBL_ENTRY_STAT_SIZE	(10)
 
 typedef struct MentorTblEntry
 {
@@ -96,8 +96,9 @@ typedef struct MentorTblEntry
 	bool		fixed; /* May it be changed automatically? */
 
 	/* Statistics */
-	uint64		nblocks[MENTOR_TBL_ENTRY_STAT_SIZE];
+	int64		nblocks[MENTOR_TBL_ENTRY_STAT_SIZE];
 	int			next_idx;
+	int64		ref_nblocks;
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -310,8 +311,9 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 {
 	int64			queryId = PG_GETARG_INT64(0);
 	int				status = PG_GETARG_INT32(1);
-	double			ref_exec_time = PG_GETARG_FLOAT8(2);
-	bool			fixed = PG_GETARG_BOOL(3);
+	double			ref_exec_time = PG_ARGISNULL(2) ? -1 : PG_GETARG_FLOAT8(2);
+	int64			ref_nblocks = PG_ARGISNULL(3) ? -1 : PG_GETARG_INT64(3);
+	bool			fixed = PG_GETARG_BOOL(4);
 	bool			found;
 	MentorTblEntry *entry;
 	bool			result = false;
@@ -322,6 +324,29 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	entry->plan_cache_mode = status;
 	entry->ref_exec_time = ref_exec_time;
 	entry->fixed = fixed;
+	if (ref_nblocks < 0)
+		entry->ref_nblocks = ref_nblocks;
+	else
+	{
+		int	i;
+
+		if (entry->nblocks[0] < 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ref_nblocks cannot be null for never executed query")));
+
+		/*
+		 * Calculate average number of blocks, used by queries with this queryId
+		 */
+		ref_nblocks = 0;
+		for(i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+		{
+			if (entry->nblocks[i] < 0)
+				break;
+			ref_nblocks += entry->nblocks[i];
+		}
+		ref_nblocks /= i;
+	}
+
 	result = true;
 
 	dshash_release_lock(pgm_hash, entry);
@@ -331,17 +356,22 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(result);
 }
 
+/*
+ * Return the ring buffer size.
+ * It may contain only MENTOR_TBL_ENTRY_STAT_SIZE elements or entry->next_idx
+ * elements in case it is not full yet.
+ */
 static int
 ring_buffer_size(MentorTblEntry *entry)
 {
-	if (unlikely(entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] == UINT64_MAX))
+	if (unlikely(entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] < 0))
 		return entry->next_idx;
 	else
 		return MENTOR_TBL_ENTRY_STAT_SIZE;
 }
 
 static ArrayType *
-form_vector(uint64 *vector, int nrows)
+form_vector(int64 *vector, int nrows)
 {
 	Datum	   *elems;
 	ArrayType  *a;
@@ -350,7 +380,7 @@ form_vector(uint64 *vector, int nrows)
 
 	elems = palloc(sizeof(*elems) * nrows);
 	for (i = 0; i < nrows; i++)
-		elems[i] = UInt64GetDatum(vector[i]);
+		elems[i] = Int64GetDatum(vector[i]);
 	a = construct_md_array(elems, NULL, 1, &nrows, &lbs, INT8OID, 8, true, 'd');
 	return a;
 }
@@ -391,6 +421,10 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 		statnum = ring_buffer_size(entry);
 		values[6] = statnum;
 		values[7] = PointerGetDatum(form_vector(entry->nblocks, statnum));
+		if (entry->ref_nblocks > 0)
+			values[8] = Int64GetDatum(entry->ref_nblocks);
+		else
+			nulls[8] = true;
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -600,8 +634,9 @@ on_prepare(PreparedStatement *ps)
 		entry->since = GetCurrentTimestamp();
 		entry->ref_exec_time = -1.0;
 		entry->next_idx = 0;
+		entry->ref_nblocks = -1;
 		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
-			entry->nblocks[i] = UINT64_MAX;
+			entry->nblocks[i] = -1;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);
@@ -710,7 +745,7 @@ static void
 on_execute(uint64 queryId, BufferUsage *bufusage)
 {
 	MentorTblEntry	   *entry;
-	uint64				nblocks;
+	int64				nblocks;
 
 	if (queryId == UINT64CONST(0))
 		return;

@@ -32,7 +32,8 @@ LANGUAGE C;
 --
 CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint,
 										status integer,
-										ref_exec_time float8 DEFAULT -1,
+										ref_exec_time float8 DEFAULT NULL,
+										ref_nblocks bigint DEFAULT NULL,
 										fixed bool DEFAULT false)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
@@ -141,7 +142,7 @@ BEGIN
 	  SELECT pg_mentor_set_plan_mode(queryid, 1, tet) FROM candidates_4)
     ) q1 JOIN
     (SELECT count(*) AS to_custom FROM (
-	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet, true) FROM candidates_2
+	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet, NULL, true) FROM candidates_2
 	    UNION ALL
 	  SELECT pg_mentor_set_plan_mode(queryid, 2, tet) FROM candidates_3)
     ) q2 JOIN LATERAL
