@@ -18,8 +18,10 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
--- Should show nothing. XXX: parallel tests may interfere here.
+-- Should show nothing, just check columns nomenclature itself.
+-- XXX: parallel tests may interfere here.
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
+SELECT * FROM pg_mentor_show_prepared_statements(-1);
 
 -- Dummy test on redundant deallocation
 PREPARE stmt0(int) AS SELECT $1+random() AS x;

@@ -82,7 +82,7 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(9)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(11)
 #define MENTOR_TBL_ENTRY_STAT_SIZE	(10)
 
 typedef struct MentorTblEntry
@@ -366,7 +366,7 @@ ring_buffer_size(MentorTblEntry *entry)
 }
 
 static ArrayType *
-form_vector(int64 *vector, int nrows)
+form_vector_int64(int64 *vector, int nrows)
 {
 	Datum	   *elems;
 	ArrayType  *a;
@@ -377,6 +377,21 @@ form_vector(int64 *vector, int nrows)
 	for (i = 0; i < nrows; i++)
 		elems[i] = Int64GetDatum(vector[i]);
 	a = construct_md_array(elems, NULL, 1, &nrows, &lbs, INT8OID, 8, true, 'd');
+	return a;
+}
+
+static ArrayType *
+form_vector_dbl(double *vector, int nrows)
+{
+	Datum	   *elems;
+	ArrayType  *a;
+	int			lbs = 1;
+	int			i;
+
+	elems = palloc(sizeof(*elems) * nrows);
+	for (i = 0; i < nrows; i++)
+		elems[i] = Float8GetDatum(vector[i]);
+	a = construct_md_array(elems, NULL, 1, &nrows, &lbs, FLOAT8OID, 8, true, 'd');
 	return a;
 }
 
@@ -415,11 +430,16 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 
 		statnum = ring_buffer_size(entry);
 		values[6] = statnum;
-		values[7] = PointerGetDatum(form_vector(entry->nblocks, statnum));
+		values[7] = PointerGetDatum(form_vector_int64(entry->nblocks, statnum));
 		if (entry->ref_nblocks > 0)
 			values[8] = Int64GetDatum(entry->ref_nblocks);
 		else
 			nulls[8] = true;
+		values[9] = PointerGetDatum(form_vector_dbl(entry->times, statnum));
+		if (entry->ref_exec_time > 0)
+			values[10] = Float8GetDatum(entry->ref_exec_time);
+		else
+			nulls[10] = true;
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

@@ -53,7 +53,10 @@ CREATE FUNCTION pg_mentor_show_prepared_statements(
   OUT ref_exec_time	float8,
   OUT fixed boolean,
   OUT statnum integer,
-  OUT nblocks bigint[])
+  OUT nblocks bigint[],
+  OUT ref_blocks bigint,
+  OUT exec_times float8[],
+  OUT ref_time float8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;

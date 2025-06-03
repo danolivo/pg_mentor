@@ -22,10 +22,16 @@ BEGIN
 	  pg_stat_statements s USING (queryid);
 END;
 $$ LANGUAGE PLPGSQL;
--- Should show nothing. XXX: parallel tests may interfere here.
+-- Should show nothing, just check columns nomenclature itself.
+-- XXX: parallel tests may interfere here.
 SELECT * FROM show_entries() ORDER BY query COLLATE "C";
  refcounter | plan_cache_mode | statnum | query 
 ------------+-----------------+---------+-------
+(0 rows)
+
+SELECT * FROM pg_mentor_show_prepared_statements(-1);
+ queryid | refcounter | plan_cache_mode | since | ref_exec_time | fixed | statnum | nblocks | ref_blocks | exec_times | ref_time 
+---------+------------+-----------------+-------+---------------+-------+---------+---------+------------+------------+----------
 (0 rows)
 
 -- Dummy test on redundant deallocation
