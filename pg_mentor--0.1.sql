@@ -32,7 +32,7 @@ LANGUAGE C;
 --
 CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint,
 										status integer,
-										ref_exec_time float8 DEFAULT NULL,
+										ref_total_time float8 DEFAULT NULL,
 										ref_nblocks bigint DEFAULT NULL,
 										fixed bool DEFAULT false)
 RETURNS bool
@@ -50,13 +50,14 @@ CREATE FUNCTION pg_mentor_show_prepared_statements(
   OUT refcounter integer,
   OUT plan_cache_mode int,
   OUT since TimestampTz,
-  OUT ref_exec_time	float8,
   OUT fixed boolean,
   OUT statnum integer,
   OUT nblocks bigint[],
-  OUT ref_blocks bigint,
   OUT exec_times float8[],
-  OUT ref_time float8)
+  OUT avg_blocks bigint,
+  OUT avg_time float8,
+  OUT ref_blocks bigint,
+  OUT ref_total_time float8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;
@@ -101,7 +102,7 @@ BEGIN
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
 	WHERE ps.statnum > 1 AND
-	  calls > ncalls AND ref_exec_time IS NULL AND
+	  calls > ncalls AND ref_total_time IS NULL AND
 	  ps.plan_cache_mode < 1 AND total_exec_time <= total_plan_time * 2.0 AND
 	  total_exec_time > 0.0 AND
 	  (SELECT avg(arr) FROM unnest(ps.nblocks) arr) > 0.0 AND
@@ -116,16 +117,16 @@ BEGIN
       calls > ncalls AND total_exec_time > total_plan_time * 2.0 AND
       -- The action 2 filters
       ps.plan_cache_mode = 1 AND
-      ref_exec_time > 0.0 AND total_exec_time/ref_exec_time > 2.0
+      ref_total_time > 0.0 AND total_exec_time/ref_total_time > 2.0
   ), candidates_3 AS (
 	-- 3. probe non-extension-forced plans looking good to be custom
 	SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
 	WHERE ps.statnum > 1 AND
-      calls > ncalls AND ref_exec_time IS NULL AND
+      calls > ncalls AND ref_total_time IS NULL AND
 	  ps.plan_cache_mode < 1 AND total_exec_time > total_plan_time * 2.0 AND
-	  (SELECT avg(arr) FROM unnest(ps.nblocks) arr) > 0.0 AND
+	  ps.avg_blocks > 0 AND
 	  (SELECT (max(arr)-min(arr))/avg(arr) FROM unnest(ps.nblocks) arr) > 2.0
   )
   , candidates_4 AS (
@@ -134,8 +135,8 @@ BEGIN
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
 	WHERE
-      calls > ncalls AND ref_exec_time > 0.0 AND not fixed AND
-	  ps.plan_cache_mode = 2 AND total_exec_time/ref_exec_time < 2.0
+      calls > ncalls AND ref_total_time > 0.0 AND not fixed AND
+	  ps.plan_cache_mode = 2 AND total_exec_time/ref_total_time < 2.0
   )
   -- Switch query plan mode in the global hash table
   SELECT q1.to_generic, q2.to_custom, q3.unchanged FROM (

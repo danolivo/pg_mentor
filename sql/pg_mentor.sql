@@ -126,7 +126,7 @@ EXECUTE qry2(1);
 -- change qry1 and qry2 plan cache modes to custom.
 SELECT * FROM reconsider_ps_modes(0, true);
 
--- Do a series of executions that have similar execution tim to decide that
+-- Do a series of executions that have similar execution time to decide that
 -- it is stable enough to go generic.
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry2(1); -- Must be custom plan

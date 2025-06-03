@@ -82,7 +82,7 @@ typedef struct SharedState
 	Oid					dbOid;
 } SharedState;
 
-#define MENTOR_TBL_ENTRY_FIELDS_NUM	(11)
+#define MENTOR_TBL_ENTRY_FIELDS_NUM	(13)
 #define MENTOR_TBL_ENTRY_STAT_SIZE	(10)
 
 typedef struct MentorTblEntry
@@ -99,9 +99,8 @@ typedef struct MentorTblEntry
 	int64		nblocks[MENTOR_TBL_ENTRY_STAT_SIZE];
 	double		times[MENTOR_TBL_ENTRY_STAT_SIZE];
 	int			next_idx;
-	double		average;
+	double		avg_nblocks;
 	int64		ref_nblocks;
-
 	double		avg_time;
 } MentorTblEntry;
 
@@ -339,7 +338,7 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 		/*
 		 * Calculate average number of blocks, used by queries with this queryId
 		 */
-		ref_nblocks = entry->average;
+		ref_nblocks = entry->avg_nblocks;
 	}
 
 	result = true;
@@ -422,24 +421,30 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 		values[1] = UInt64GetDatum(entry->refcounter);
 		values[2] = Int32GetDatum(entry->plan_cache_mode);
 		values[3] = TimestampTzGetDatum(entry->since);
-		if (entry->ref_exec_time >= 0.0)
-			values[4] = Float8GetDatum(entry->ref_exec_time);
-		else
-			nulls[4] = true;
-		values[5] = BoolGetDatum(entry->fixed);
+		values[4] = BoolGetDatum(entry->fixed);
 
 		statnum = ring_buffer_size(entry);
-		values[6] = statnum;
-		values[7] = PointerGetDatum(form_vector_int64(entry->nblocks, statnum));
-		if (entry->ref_nblocks > 0)
-			values[8] = Int64GetDatum(entry->ref_nblocks);
+		values[5] = Int32GetDatum(statnum);
+		if (statnum == 0)
+		{
+			nulls[6] = nulls[7] = nulls[8] = nulls[9] = true;
+		}
 		else
-			nulls[8] = true;
-		values[9] = PointerGetDatum(form_vector_dbl(entry->times, statnum));
-		if (entry->ref_exec_time > 0)
-			values[10] = Float8GetDatum(entry->ref_exec_time);
+		{
+			values[6] = PointerGetDatum(form_vector_int64(entry->nblocks, statnum));
+			values[7] = PointerGetDatum(form_vector_dbl(entry->times, statnum));
+			values[8] = Int64GetDatum(entry->avg_nblocks);
+			values[9] = Float8GetDatum(entry->avg_time);
+		}
+
+		if (entry->ref_nblocks > 0)
+			values[10] = Int64GetDatum(entry->ref_nblocks);
 		else
 			nulls[10] = true;
+		if (entry->ref_exec_time > 0.)
+			values[11] = Float8GetDatum(entry->ref_exec_time);
+		else
+			nulls[11] = true;
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -650,7 +655,7 @@ on_prepare(PreparedStatement *ps)
 		entry->ref_exec_time = -1.0;
 		entry->next_idx = 0;
 		entry->ref_nblocks = -1;
-		entry->average = 0;
+		entry->avg_nblocks = 0;
 		entry->avg_time = 0;
 		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
 			entry->nblocks[i] = -1;
@@ -781,7 +786,7 @@ on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
 	 */
 	if (ring_buffer_size(entry) == MENTOR_TBL_ENTRY_STAT_SIZE)
 	{
-		entry->average +=
+		entry->avg_nblocks +=
 				(-entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] +
 										nblocks) / MENTOR_TBL_ENTRY_STAT_SIZE;
 		entry->avg_time +=
@@ -790,7 +795,7 @@ on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
 	}
 	else
 	{
-		entry->average = (entry->average * entry->next_idx + nblocks) /
+		entry->avg_nblocks = (entry->avg_nblocks * entry->next_idx + nblocks) /
 														(entry->next_idx + 1);
 		entry->avg_time = (entry->avg_time * entry->next_idx + exec_time) /
 														(entry->next_idx + 1);
