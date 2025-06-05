@@ -30,8 +30,8 @@ SELECT * FROM show_entries() ORDER BY query COLLATE "C";
 (0 rows)
 
 SELECT * FROM pg_mentor_show_prepared_statements(-1);
- queryid | refcounter | plan_cache_mode | since | fixed | statnum | nblocks | exec_times | avg_blocks | avg_time | ref_blocks | ref_total_time 
----------+------------+-----------------+-------+-------+---------+---------+------------+------------+----------+------------+----------------
+ queryid | refcounter | plan_cache_mode | since | fixed | statnum | nblocks | exec_times | avg_nblocks | avg_exec_time | ref_nblocks | ref_exec_time | plan_time 
+---------+------------+-----------------+-------+-------+---------+---------+------------+-------------+---------------+-------------+---------------+-----------
 (0 rows)
 
 -- Dummy test on redundant deallocation

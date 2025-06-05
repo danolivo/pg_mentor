@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "commands/extension.h"
 #include "commands/prepare.h"
@@ -42,9 +43,14 @@ PG_FUNCTION_INFO_V1(pg_mentor_reload_conf);
 PG_FUNCTION_INFO_V1(pg_mentor_set_plan_mode);
 PG_FUNCTION_INFO_V1(pg_mentor_show_prepared_statements);
 PG_FUNCTION_INFO_V1(pg_mentor_reset);
+PG_FUNCTION_INFO_V1(reconsider_ps_modes1);
 
-static const char *psfuncname = "pg_prepared_statement";
-static Oid		   psfuncoid = 0;
+static const char  *psfuncname = "pg_prepared_statement";
+static Oid			psfuncoid = 0;
+static int			nesting_level = 0;
+
+#define pgm_enabled(level) \
+	(!IsParallelWorker() && (level) == 0)
 
 /*
  * List of intercepted hooks.
@@ -100,8 +106,9 @@ typedef struct MentorTblEntry
 	double		times[MENTOR_TBL_ENTRY_STAT_SIZE];
 	int			next_idx;
 	double		avg_nblocks;
-	int64		ref_nblocks;
-	double		avg_time;
+	double		ref_nblocks;
+	double		avg_exec_time;
+	double		plan_time;
 } MentorTblEntry;
 
 static dsa_area *dsa = NULL;
@@ -231,6 +238,7 @@ typedef struct LocaLPSEntry
 {
 	uint64	queryId;
 	int32	refcounter;
+	double	plan_time;
 } LocaLPSEntry;
 
 /*
@@ -309,13 +317,34 @@ pg_mentor_reload_conf(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(true);
 }
 
+static bool
+pg_mentor_set_plan_mode_int(MentorTblEntry *entry, int status,
+							double ref_exec_time, double ref_nblocks, bool fixed)
+{
+	entry->plan_cache_mode = status;
+	entry->fixed = fixed;
+
+	if (entry->nblocks[0] < 0 && (ref_nblocks < 0. || ref_exec_time < 0.))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("reference data cannot be null for never executed query")));
+
+	entry->ref_nblocks = (ref_nblocks > 0.) ?
+											ref_nblocks : entry->avg_nblocks;
+	entry->ref_exec_time = (ref_exec_time > 0.) ?
+											ref_exec_time : entry->avg_exec_time;
+
+	/* Tell other backends that they may update their statuses. */
+	move_mentor_status();
+	return true;
+}
+
 Datum
 pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 {
 	int64			queryId = PG_GETARG_INT64(0);
 	int				status = PG_GETARG_INT32(1);
-	double			ref_exec_time = PG_ARGISNULL(2) ? -1 : PG_GETARG_FLOAT8(2);
-	int64			ref_nblocks = PG_ARGISNULL(3) ? -1 : PG_GETARG_INT64(3);
+	double			ref_exec_time = PG_ARGISNULL(2) ? -1. : PG_GETARG_FLOAT8(2);
+	double			ref_nblocks = PG_ARGISNULL(3) ? -1. : PG_GETARG_FLOAT8(3);
 	bool			fixed = PG_GETARG_BOOL(4);
 	bool			found;
 	MentorTblEntry *entry;
@@ -324,29 +353,10 @@ pg_mentor_set_plan_mode(PG_FUNCTION_ARGS)
 	pgm_init_shmem();
 
 	entry = (MentorTblEntry *) dshash_find_or_insert(pgm_hash, &queryId, &found);
-	entry->plan_cache_mode = status;
-	entry->ref_exec_time = ref_exec_time;
-	entry->fixed = fixed;
-	if (ref_nblocks < 0)
-		entry->ref_nblocks = ref_nblocks;
-	else
-	{
-		if (entry->nblocks[0] < 0)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ref_nblocks cannot be null for never executed query")));
-
-		/*
-		 * Calculate average number of blocks, used by queries with this queryId
-		 */
-		ref_nblocks = entry->avg_nblocks;
-	}
-
-	result = true;
+	result = pg_mentor_set_plan_mode_int(entry, status, ref_exec_time,
+										 ref_nblocks, fixed);
 
 	dshash_release_lock(pgm_hash, entry);
-	/* Tell other backends that they may update their statuses. */
-	move_mentor_status();
-
 	PG_RETURN_BOOL(result);
 }
 
@@ -433,18 +443,22 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 		{
 			values[6] = PointerGetDatum(form_vector_int64(entry->nblocks, statnum));
 			values[7] = PointerGetDatum(form_vector_dbl(entry->times, statnum));
-			values[8] = Int64GetDatum(entry->avg_nblocks);
-			values[9] = Float8GetDatum(entry->avg_time);
+			values[8] = Float8GetDatum(entry->avg_nblocks);
+			values[9] = Float8GetDatum(entry->avg_exec_time);
 		}
 
 		if (entry->ref_nblocks > 0)
-			values[10] = Int64GetDatum(entry->ref_nblocks);
+			values[10] = Float8GetDatum(entry->ref_nblocks);
 		else
 			nulls[10] = true;
 		if (entry->ref_exec_time > 0.)
 			values[11] = Float8GetDatum(entry->ref_exec_time);
 		else
 			nulls[11] = true;
+		if (entry->plan_time >= 0.)
+			values[12] = Float8GetDatum(entry->plan_time);
+		else
+			nulls[12] = true;
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -452,6 +466,116 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 
 	return (Datum) 0;
 }
+
+#include "math.h"
+
+static double
+calculateStandardDeviation(int N, int64 data[])
+{
+    double	sum = 0;
+	double	mean;
+	double	values = 0;
+
+    for (int i = 0; i < N; i++)
+	{
+        sum += data[i];
+    }
+
+    mean = sum / N;
+    for (int i = 0; i < N; i++)
+	{
+        values += pow(data[i] - mean, 2);
+    }
+
+    return sqrt(values / N);
+}
+
+Datum
+reconsider_ps_modes1(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	dshash_seq_status	hash_seq;
+	MentorTblEntry	   *entry;
+	HeapTuple			tuple;
+	int32				to_generic = 0;
+	int32				to_custom = 0;
+	int32				nvalues = 0;
+	Datum				values[3] = {0};
+	bool				nulls[3] = {0};
+	double				stddev;
+
+	pgm_init_shmem();
+
+//	InitMaterializedSRF(fcinfo, 0);
+
+	dshash_seq_init(&hash_seq, pgm_hash, false);
+	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
+	{
+		int	statnum = ring_buffer_size(entry);
+
+		nvalues++;
+
+		/* Do we need to skip this record? */
+		if (entry->plan_cache_mode < 0)
+			continue;
+
+		if (entry->avg_nblocks <= 0. || statnum <= 1)
+			continue;
+
+		stddev = calculateStandardDeviation(statnum, entry->nblocks);
+
+		/* Step 1: auto-mode => generic */
+		if (entry->plan_cache_mode == 0 && !entry->fixed &&
+			entry->ref_exec_time < 0. &&
+			entry->avg_exec_time < entry->plan_time &&
+			stddev / entry->avg_nblocks <= 0.3)
+		{
+			pg_mentor_set_plan_mode_int(entry, 1, -1, -1, false);
+			to_generic++;
+		}
+		/* Step 2: */
+		else if (entry->plan_cache_mode == 1 && !entry->fixed &&
+			entry->ref_exec_time > 0. &&
+			entry->avg_exec_time < entry->plan_time * 2.0 &&
+			entry->avg_nblocks/entry->ref_nblocks > 1.0)
+		{
+			pg_mentor_set_plan_mode_int(entry, 2, -1, -1, false);
+			to_custom++;
+		}
+		/* Step 3: auto-mode => custom */
+		else if (entry->plan_cache_mode == 0 && !entry->fixed &&
+			entry->ref_exec_time <= 0. &&
+			entry->avg_exec_time > entry->plan_time * 1.0 &&
+			stddev / entry->avg_nblocks > 0.5)
+		{
+			pg_mentor_set_plan_mode_int(entry, 2, -1, -1, false);
+			to_custom++;
+		}
+		/* Step 4: 'custom' => 'generic' */
+		else if (entry->plan_cache_mode == 2 && !entry->fixed &&
+			entry->ref_exec_time > 0. &&
+			(entry->avg_exec_time < entry->plan_time * 2.0 ||
+			entry->ref_nblocks / entry->avg_nblocks < 2.0) &&
+			stddev / entry->avg_nblocks <= 0.3)
+		{
+			pg_mentor_set_plan_mode_int(entry, 1, -1, -1, false);
+			to_generic++;
+		}
+		else
+		{
+			/* Skip the record */
+		}
+	}
+	dshash_seq_term(&hash_seq);
+
+	values[0] = Int32GetDatum(to_generic);
+	values[1] = Int32GetDatum(to_custom);
+	values[2] = Int32GetDatum(nvalues - to_generic - to_custom);
+
+	tuple = heap_form_tuple(rsinfo->expectedDesc, values, nulls);
+	return HeapTupleGetDatum(tuple);
+}
+
 
 /*
  * Clean all decisions has been made
@@ -468,14 +592,22 @@ pg_mentor_reset(PG_FUNCTION_ARGS)
 	dshash_seq_init(&hash_seq, pgm_hash, true);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
-		if (entry->plan_cache_mode > 0)
-		{
-			entry->plan_cache_mode = 0;
-			entry->fixed = false;
-			entry->ref_exec_time = -1;
-			entry->since = 0;
-			counter++;
-		}
+		int i;
+
+		entry->plan_cache_mode = 0;
+		entry->fixed = false;
+		entry->ref_exec_time = -1;
+		entry->since = 0;
+		entry->next_idx = 0;
+		entry->ref_exec_time = -1.0;
+		entry->ref_nblocks = -1.;
+		entry->avg_exec_time = 0.;
+		entry->avg_nblocks = 0.;
+		counter++;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->nblocks[i] = -1;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->times[i] = -1;
 	}
 	dshash_seq_term(&hash_seq);
 	PG_RETURN_INT32(counter);
@@ -565,21 +697,69 @@ pgm_planner(Query *parse, const char *query_string,
 {
 	PlannedStmt *result;
 
-	if (prev_planner_hook)
-		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
+	if (pgm_enabled(nesting_level) && query_string
+		&& parse->queryId != INT64CONST(0) && IsTransactionState() &&
+		get_extension_oid(MODULENAME, true))
+	{
+		instr_time	start;
+		instr_time	duration;
+		bool			found;
+
+		INSTR_TIME_SET_CURRENT(start);
+
+		nesting_level++;
+		PG_TRY();
+		{
+			if (prev_planner_hook)
+				result = (*prev_planner_hook) (parse, query_string,
+											   cursorOptions, boundParams);
+			else
+				result = standard_planner(parse, query_string, cursorOptions,
+										  boundParams);
+		}
+		PG_FINALLY();
+		{
+			nesting_level--;
+		}
+		PG_END_TRY();
+
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+
+		pgm_init_shmem();
+		check_state();
+
+		/* Be gentle and track queries are known as prepared statements */
+		(void) hash_search(pgm_local_hash, &result->queryId, HASH_FIND, &found);
+		if (found)
+		{
+			MentorTblEntry *entry;
+
+			entry = (MentorTblEntry *) dshash_find(pgm_hash, &result->queryId,
+												   true);
+			Assert(entry != NULL);
+			entry->plan_time = INSTR_TIME_GET_MILLISEC(duration);
+			dshash_release_lock(pgm_hash, entry);
+		}
+	}
 	else
-		result = standard_planner(parse, query_string, cursorOptions, boundParams);;
-
-	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
-		/*
-		 * Our extension doesn't exist in the database the backend is
-		 * registered in, do nothing.
-		 */
-		return result;
-
-	pgm_init_shmem();
-
-	check_state();
+	{
+		nesting_level++;
+		PG_TRY();
+		{
+			if (prev_planner_hook)
+				result = prev_planner_hook(parse, query_string, cursorOptions,
+										   boundParams);
+			else
+				result = standard_planner(parse, query_string, cursorOptions,
+										  boundParams);
+		}
+		PG_FINALLY();
+		{
+			nesting_level--;
+		}
+		PG_END_TRY();
+	}
 
 	return result;
 }
@@ -654,11 +834,13 @@ on_prepare(PreparedStatement *ps)
 		entry->since = GetCurrentTimestamp();
 		entry->ref_exec_time = -1.0;
 		entry->next_idx = 0;
-		entry->ref_nblocks = -1;
-		entry->avg_nblocks = 0;
-		entry->avg_time = 0;
+		entry->ref_nblocks = -1.;
+		entry->avg_nblocks = 0.;
+		entry->avg_exec_time = 0.;
 		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
 			entry->nblocks[i] = -1;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->times[i] = -1;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);
@@ -667,7 +849,10 @@ on_prepare(PreparedStatement *ps)
 	lentry = (LocaLPSEntry *) hash_search(pgm_local_hash,
 										  &queryId, HASH_ENTER, &found1);
 	if (!found1)
+	{
 		lentry->refcounter = 1;
+		lentry->plan_time = -1.;
+	}
 	else
 		lentry->refcounter++;
 
@@ -789,7 +974,7 @@ on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
 		entry->avg_nblocks +=
 				(-entry->nblocks[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] +
 										nblocks) / MENTOR_TBL_ENTRY_STAT_SIZE;
-		entry->avg_time +=
+		entry->avg_exec_time +=
 				(-entry->times[entry->next_idx % MENTOR_TBL_ENTRY_STAT_SIZE] +
 										exec_time) / MENTOR_TBL_ENTRY_STAT_SIZE;
 	}
@@ -797,7 +982,7 @@ on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
 	{
 		entry->avg_nblocks = (entry->avg_nblocks * entry->next_idx + nblocks) /
 														(entry->next_idx + 1);
-		entry->avg_time = (entry->avg_time * entry->next_idx + exec_time) /
+		entry->avg_exec_time = (entry->avg_exec_time * entry->next_idx + exec_time) /
 														(entry->next_idx + 1);
 	}
 
@@ -915,12 +1100,6 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 	}
 }
 
-static int	nesting_level = 0;
-#include "access/parallel.h"
-
-#define pgm_enabled(level) \
-	(!IsParallelWorker() && (level) == 0)
-
 static void
 pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
@@ -931,7 +1110,8 @@ pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
-	if (pgm_enabled(nesting_level) && queryId != UINT64CONST(0))
+	if (pgm_enabled(nesting_level) && queryId != UINT64CONST(0) &&
+		((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0))
 	{
 		bool			found;
 
@@ -994,7 +1174,8 @@ pgm_ExecutorEnd(QueryDesc *queryDesc)
 	uint64		queryId = queryDesc->plannedstmt->queryId;
 
 	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
-		pgm_enabled(nesting_level))
+		pgm_enabled(nesting_level) &&
+		((queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0))
 	{
 		bool	found;
 

@@ -33,7 +33,7 @@ LANGUAGE C;
 CREATE FUNCTION pg_mentor_set_plan_mode(queryId bigint,
 										status integer,
 										ref_total_time float8 DEFAULT NULL,
-										ref_nblocks bigint DEFAULT NULL,
+										ref_nblocks float8 DEFAULT NULL,
 										fixed bool DEFAULT false)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'pg_mentor_set_plan_mode'
@@ -54,10 +54,11 @@ CREATE FUNCTION pg_mentor_show_prepared_statements(
   OUT statnum integer,
   OUT nblocks bigint[],
   OUT exec_times float8[],
-  OUT avg_blocks bigint,
-  OUT avg_time float8,
-  OUT ref_blocks bigint,
-  OUT ref_total_time float8)
+  OUT avg_nblocks float8,
+  OUT avg_exec_time float8,
+  OUT ref_nblocks float8,
+  OUT ref_exec_time float8,
+  OUT plan_time float8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_mentor_show_prepared_statements'
 LANGUAGE C;
@@ -86,6 +87,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE FUNCTION reconsider_ps_modes1(OUT to_generic bigint,
+									OUT to_custom bigint,
+									OUT unchanged bigint)
+RETURNS record
+AS 'MODULE_PATHNAME', 'reconsider_ps_modes1'
+LANGUAGE C;
+
 CREATE FUNCTION reconsider_ps_modes(IN ncalls integer DEFAULT 0,
 									IN reset_stat boolean DEFAULT false,
 									OUT to_generic bigint,
@@ -101,12 +109,13 @@ BEGIN
     SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
-	WHERE ps.statnum > 1 AND
-	  calls > ncalls AND ref_total_time IS NULL AND
-	  ps.plan_cache_mode < 1 AND total_exec_time <= total_plan_time * 2.0 AND
+	WHERE
+	  ps.avg_nblocks > 0. AND
+	  ref_exec_time IS NULL AND ps.statnum > 1 AND ps.plan_cache_mode < 1 AND
+	  calls > ncalls AND
+	  total_exec_time <= total_plan_time * 2.0 AND
 	  total_exec_time > 0.0 AND
-	  (SELECT avg(arr) FROM unnest(ps.nblocks) arr) > 0.0 AND
-	  (SELECT (max(arr)-min(arr))/avg(arr) FROM unnest(ps.nblocks) arr) <= 2.0
+	  (SELECT stddev(arr)/ps.avg_nblocks FROM unnest(ps.nblocks) arr) <= 0.3
   ), candidates_2 AS (
     -- 2. detect unsuccessful 'to generic' switches
     SELECT queryid, total_exec_time AS tet
@@ -114,29 +123,29 @@ BEGIN
 	USING (queryid)
 	WHERE
       -- Basic filters
+	  ps.statnum > 1 AND ps.avg_nblocks > 0. AND
       calls > ncalls AND total_exec_time > total_plan_time * 2.0 AND
       -- The action 2 filters
       ps.plan_cache_mode = 1 AND
-      ref_total_time > 0.0 AND total_exec_time/ref_total_time > 2.0
+      ref_exec_time > 0.0 AND avg_exec_time/ref_exec_time > 2.0
   ), candidates_3 AS (
 	-- 3. probe non-extension-forced plans looking good to be custom
 	SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
-	WHERE ps.statnum > 1 AND
-      calls > ncalls AND ref_total_time IS NULL AND
+	WHERE ps.statnum > 1 AND ps.avg_nblocks > 0. AND ref_exec_time IS NULL AND
+      calls > ncalls AND
 	  ps.plan_cache_mode < 1 AND total_exec_time > total_plan_time * 2.0 AND
-	  ps.avg_blocks > 0 AND
-	  (SELECT (max(arr)-min(arr))/avg(arr) FROM unnest(ps.nblocks) arr) > 2.0
+	  (SELECT stddev(arr)/ps.avg_nblocks FROM unnest(ps.nblocks) arr) > 0.5
   )
   , candidates_4 AS (
 	-- 4. detect unsuccessful 'to custom' switches
 	SELECT queryid, total_exec_time AS tet
     FROM pg_stat_statements ss JOIN pg_mentor_show_prepared_statements(-1) ps
 	USING (queryid)
-	WHERE
-      calls > ncalls AND ref_total_time > 0.0 AND not fixed AND
-	  ps.plan_cache_mode = 2 AND total_exec_time/ref_total_time < 2.0
+	WHERE ps.statnum > 1 AND ps.avg_nblocks > 0. AND
+      calls > ncalls AND ref_exec_time > 0.0 AND not fixed AND
+	  ps.plan_cache_mode = 2 AND total_exec_time/ref_exec_time < 2.0
   )
   -- Switch query plan mode in the global hash table
   SELECT q1.to_generic, q2.to_custom, q3.unchanged FROM (

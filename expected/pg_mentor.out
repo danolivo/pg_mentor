@@ -41,10 +41,11 @@ CREATE TABLE test(x integer);
 VACUUM ANALYZE test;
 PREPARE stmt1(integer) AS SELECT * FROM test WHERE x = $1;
 SELECT get_queryId('EXECUTE stmt1(1)') AS query_id \gset
-EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- custom plan
-    QUERY PLAN     
--------------------
- Seq Scan on test
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE stmt1(1); -- custom plan
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on test (actual rows=0.00 loops=1)
    Filter: (x = 1)
 (2 rows)
 
@@ -54,10 +55,11 @@ SELECT pg_mentor_set_plan_mode(:query_id, 1);
  t
 (1 row)
 
-EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- generic plan
-     QUERY PLAN     
---------------------
- Seq Scan on test
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE stmt1(1); -- generic plan
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on test (actual rows=0.00 loops=1)
    Filter: (x = $1)
 (2 rows)
 
@@ -67,10 +69,11 @@ SELECT pg_mentor_set_plan_mode(:query_id, 2);
  t
 (1 row)
 
-EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- custom plan
-    QUERY PLAN     
--------------------
- Seq Scan on test
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE stmt1(1); -- custom plan
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on test (actual rows=0.00 loops=1)
    Filter: (x = 1)
 (2 rows)
 
@@ -80,10 +83,11 @@ SELECT pg_mentor_set_plan_mode(:query_id, 0);
  t
 (1 row)
 
-EXPLAIN (COSTS OFF) EXECUTE stmt1(1); -- auto mode
-    QUERY PLAN     
--------------------
- Seq Scan on test
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE stmt1(1); -- auto mode
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on test (actual rows=0.00 loops=1)
    Filter: (x = 1)
 (2 rows)
 
@@ -202,23 +206,47 @@ CREATE TABLE part3 AS SELECT 201::int AS id
 FROM generate_series(1,1E4) AS x;
 VACUUM ANALYZE part3;
 ALTER TABLE part ATTACH PARTITION part3 FOR VALUES FROM (200) to (301);
-PREPARE qry1 (integer[]) AS SELECT * FROM part WHERE id = ANY ($1);
--- Step 3: should be bad because sometimes we return single tuple but sometimes
--- multiple tuples. Planning is quick enough.
-PREPARE qry2 (integer) AS SELECT * FROM part WHERE id < $1;
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry2(210);
-                          QUERY PLAN                           
----------------------------------------------------------------
- Append (actual rows=20000.00 loops=1)
-   ->  Seq Scan on part1 part_1 (actual rows=5000.00 loops=1)
-         Filter: (id < 210)
-   ->  Seq Scan on part2 part_2 (actual rows=5000.00 loops=1)
-         Filter: (id < 210)
-   ->  Seq Scan on part3 part_3 (actual rows=10000.00 loops=1)
-         Filter: (id < 210)
-(7 rows)
+SELECT pg_mentor_reset(); -- Clear previous decisions & PS-statistics
+ pg_mentor_reset 
+-----------------
+               6
+(1 row)
 
+-- Check reset operation
+SELECT
+  refcounter, plan_cache_mode, fixed, statnum, nblocks, exec_times,
+  avg_nblocks, avg_exec_time, ref_nblocks, ref_exec_time
+FROM pg_mentor_show_prepared_statements(-1) ps;
+ refcounter | plan_cache_mode | fixed | statnum | nblocks | exec_times | avg_nblocks | avg_exec_time | ref_nblocks | ref_exec_time 
+------------+-----------------+-------+---------+---------+------------+-------------+---------------+-------------+---------------
+          1 |               0 | f     |       0 |         |            |             |               |             |              
+          1 |               0 | f     |       0 |         |            |             |               |             |              
+          0 |               0 | f     |       0 |         |            |             |               |             |              
+          0 |               0 | f     |       0 |         |            |             |               |             |              
+          0 |               0 | f     |       0 |         |            |             |               |             |              
+          0 |               0 | f     |       0 |         |            |             |               |             |              
+(6 rows)
+
+--
+-- qry1 is a subject of pruning.
+-- qry2 may cause multiple-blocks scanning operations
+PREPARE qry1 (integer[]) AS SELECT * FROM part WHERE id = ANY ($1);
+PREPARE qry2 (integer) AS SELECT * FROM part WHERE id < $1;
+-- Just let them to be executed. Stable executions should led to decisions:
+-- qry1 - good candidate to be generic (stable execution, long planning)
+-- qry2 - a little volatile load don't allow to force it as generic.
+-- They both can't be switched to generic automatically because of partition
+-- pruning.
+\o /dev/null
+EXECUTE qry1(ARRAY[1,2]) \watch i=0 c=10
+
+EXECUTE qry2(110);
+EXECUTE qry2(190);
+EXECUTE qry2(100);
+EXECUTE qry2(180);
+EXECUTE qry2(135);
+\o
+-- See the current state of the prepared statements. Both have a custom plan
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,2]); -- good execution
                                    QUERY PLAN                                   
@@ -228,22 +256,6 @@ EXECUTE qry1(ARRAY[1,2]); -- good execution
    Heap Fetches: 0
    Index Searches: 1
 (4 rows)
-
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,2]); -- need another one to not decide on a single shot
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
-   Index Cond: (id = ANY ('{1,2}'::integer[]))
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
-
-SELECT * FROM reconsider_ps_modes(); -- good to try generic plan mode
- to_generic | to_custom | unchanged 
-------------+-----------+-----------
-          1 |         0 |         7
-(1 row)
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry2(110);
@@ -258,8 +270,17 @@ EXECUTE qry2(110);
          Index Searches: 1
 (7 rows)
 
+-- qry1 - auto -> force generic plan mode (step 1.)
+-- qry2 stay as is
+SELECT * FROM reconsider_ps_modes1();
+ to_generic | to_custom | unchanged 
+------------+-----------+-----------
+          1 |         0 |         7
+(1 row)
+
+-- Check: qry1 (generic), qry2 (custom).
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]); -- one more good execution
+EXECUTE qry1(ARRAY[1,2]);
                                        QUERY PLAN                                       
 ----------------------------------------------------------------------------------------
  Append (actual rows=100.00 loops=1)
@@ -277,7 +298,30 @@ EXECUTE qry1(ARRAY[1,3]); -- one more good execution
          Index Searches: 1
 (13 rows)
 
-SELECT * FROM reconsider_ps_modes(); -- do not change previous decision
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(110);
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Append (actual rows=5500.00 loops=1)
+   ->  Seq Scan on part1 part_1 (actual rows=5000.00 loops=1)
+         Filter: (id < 110)
+   ->  Index Only Scan using part2_id_idx2 on part2 part_2 (actual rows=500.00 loops=1)
+         Index Cond: (id < 110)
+         Heap Fetches: 0
+         Index Searches: 1
+(7 rows)
+
+-- Stable execution enough to not be forced as custom. Also, it can't be
+-- switched to generic by the core because of pruned plan cost.
+\o /dev/null
+EXECUTE qry2(110+random()*5::integer) \watch i=0 c=10
+
+-- more stable executions for qry1
+EXECUTE qry1(ARRAY[1,1]) \watch i=0 c=10
+
+\o
+-- Previous executions were stable enough. So, no change in decisions.
+SELECT * FROM reconsider_ps_modes1();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         0 |         8
@@ -303,7 +347,7 @@ EXECUTE qry1(ARRAY[1,201]); --bad execution
 (13 rows)
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry2(1);
+EXECUTE qry2(1); -- custom
                                   QUERY PLAN                                   
 -------------------------------------------------------------------------------
  Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
@@ -312,12 +356,40 @@ EXECUTE qry2(1);
    Index Searches: 1
 (4 rows)
 
--- change qry1 and qry2 plan cache modes to custom.
-SELECT * FROM reconsider_ps_modes(0, true);
+\o /dev/null
+EXECUTE qry1(ARRAY[1,200]);
+EXECUTE qry2(30);
+EXECUTE qry2(299);
+EXECUTE qry2(2);
+EXECUTE qry2(10);
+EXECUTE qry2(280);
+\o
+-- change qry1 and qry2 plan cache modes to forced custom.
+SELECT * FROM reconsider_ps_modes1();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         2 |         6
 (1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry1(ARRAY[1,3]);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
+   Index Cond: (id = ANY ('{1,3}'::integer[]))
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
+EXECUTE qry2(1);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
+   Index Cond: (id < 1)
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)
 
 -- Do a series of executions that have similar execution time to decide that
 -- it is stable enough to go generic.
@@ -331,58 +403,15 @@ EXECUTE qry2(1); -- Must be custom plan
    Index Searches: 1
 (4 rows)
 
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry2(1);
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
-   Index Cond: (id < 1)
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
+\o /dev/null
+EXECUTE qry2(1) \watch i=0 c=10
 
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry2(1);
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=50.00 loops=1)
-   Index Cond: (id < 1)
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
+EXECUTE qry1(ARRAY[1,3]); \watch i=0 c=3
 
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]);
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
-   Index Cond: (id = ANY ('{1,3}'::integer[]))
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
-
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]);
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
-   Index Cond: (id = ANY ('{1,3}'::integer[]))
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
-
-EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
-EXECUTE qry1(ARRAY[1,3]);
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
- Index Only Scan using part1_id_idx2 on part1 part (actual rows=100.00 loops=1)
-   Index Cond: (id = ANY ('{1,3}'::integer[]))
-   Heap Fetches: 0
-   Index Searches: 1
-(4 rows)
-
--- Nothing changes, switch back to generic plan for qry2 and don't change qry1.
-SELECT * FROM reconsider_ps_modes(0, true);
+\o
+-- Query execution is stable enough: switch back to generic plan for qry2,
+--  don't change qry1 plan cache mode.
+SELECT * FROM reconsider_ps_modes1();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           1 |         0 |         7
