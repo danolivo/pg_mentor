@@ -100,7 +100,7 @@ typedef struct MentorTblEntry
 	double		times[MENTOR_TBL_ENTRY_STAT_SIZE];
 	int			next_idx;
 	double		avg_nblocks;
-	int64		ref_nblocks;
+	double		ref_nblocks;
 	double		avg_time;
 } MentorTblEntry;
 
@@ -433,12 +433,12 @@ pg_mentor_show_prepared_statements(PG_FUNCTION_ARGS)
 		{
 			values[6] = PointerGetDatum(form_vector_int64(entry->nblocks, statnum));
 			values[7] = PointerGetDatum(form_vector_dbl(entry->times, statnum));
-			values[8] = Int64GetDatum(entry->avg_nblocks);
+			values[8] = Float8GetDatum(entry->avg_nblocks);
 			values[9] = Float8GetDatum(entry->avg_time);
 		}
 
 		if (entry->ref_nblocks > 0)
-			values[10] = Int64GetDatum(entry->ref_nblocks);
+			values[10] = Float8GetDatum(entry->ref_nblocks);
 		else
 			nulls[10] = true;
 		if (entry->ref_exec_time > 0.)
@@ -468,14 +468,22 @@ pg_mentor_reset(PG_FUNCTION_ARGS)
 	dshash_seq_init(&hash_seq, pgm_hash, true);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
-		if (entry->plan_cache_mode > 0)
-		{
-			entry->plan_cache_mode = 0;
-			entry->fixed = false;
-			entry->ref_exec_time = -1;
-			entry->since = 0;
-			counter++;
-		}
+		int i;
+
+		entry->plan_cache_mode = 0;
+		entry->fixed = false;
+		entry->ref_exec_time = -1;
+		entry->since = 0;
+		entry->next_idx = 0;
+		entry->ref_exec_time = -1.0;
+		entry->ref_nblocks = -1.;
+		entry->avg_time = 0.;
+		entry->avg_nblocks = 0.;
+		counter++;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->nblocks[i] = -1;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->times[i] = -1;
 	}
 	dshash_seq_term(&hash_seq);
 	PG_RETURN_INT32(counter);
@@ -654,11 +662,13 @@ on_prepare(PreparedStatement *ps)
 		entry->since = GetCurrentTimestamp();
 		entry->ref_exec_time = -1.0;
 		entry->next_idx = 0;
-		entry->ref_nblocks = -1;
-		entry->avg_nblocks = 0;
-		entry->avg_time = 0;
+		entry->ref_nblocks = -1.;
+		entry->avg_nblocks = 0.;
+		entry->avg_time = 0.;
 		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
 			entry->nblocks[i] = -1;
+		for (i = 0; i < MENTOR_TBL_ENTRY_STAT_SIZE; i++)
+			entry->times[i] = -1;
 	}
 	refcounter = entry->refcounter;
 	dshash_release_lock(pgm_hash, entry);
@@ -931,7 +941,8 @@ pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
-	if (pgm_enabled(nesting_level) && queryId != UINT64CONST(0))
+	if (pgm_enabled(nesting_level) && queryId != UINT64CONST(0) &&
+		((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0))
 	{
 		bool			found;
 
@@ -994,7 +1005,8 @@ pgm_ExecutorEnd(QueryDesc *queryDesc)
 	uint64		queryId = queryDesc->plannedstmt->queryId;
 
 	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
-		pgm_enabled(nesting_level))
+		pgm_enabled(nesting_level) &&
+		((queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0))
 	{
 		bool	found;
 
