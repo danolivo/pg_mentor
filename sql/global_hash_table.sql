@@ -1,4 +1,5 @@
-CREATE EXTENSION pg_mentor CASCADE;
+CREATE EXTENSION pg_mentor;
+CREATE EXTENSION pg_stat_statements;
 SELECT 1 AS noname FROM pg_mentor_reset();
 
 -- Show stable (architecture-independent) parameters of the entry and
@@ -92,3 +93,4 @@ JOIN pg_stat_statements s USING (queryid) WHERE s.query LIKE '%pg_class%';
 DEALLOCATE ALL;
 DROP FUNCTION show_entries();
 DROP EXTENSION pg_mentor;
+DROP EXTENSION pg_stat_statements;

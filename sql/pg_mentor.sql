@@ -3,7 +3,8 @@
  * default it may be unstable. We tune queries as much is possible to be stable.
  * But still, don't care immediately, if results comparison is failed.
  */
-CREATE EXTENSION pg_mentor CASCADE;
+CREATE EXTENSION pg_mentor;
+CREATE EXTENSION pg_stat_statements;
 
 CREATE FUNCTION show_entries()
 RETURNS TABLE (
@@ -200,3 +201,5 @@ EXECUTE qry1(ARRAY[1,3]); -- must be custom
 
 DEALLOCATE ALL;
 DROP TABLE test CASCADE;
+DROP EXTENSION pg_stat_statements;
+DROP EXTENSION pg_mentor;
