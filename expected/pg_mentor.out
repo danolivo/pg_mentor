@@ -98,6 +98,12 @@ SELECT true FROM pg_stat_statements_reset(0, :dboid);
  t
 (1 row)
 
+SELECT pg_mentor_reset();
+ pg_mentor_reset 
+-----------------
+               5
+(1 row)
+
 -- Prepare the case when custom plan cost all the time much less than the
 -- generic one
 CREATE TABLE part (
@@ -196,7 +202,7 @@ EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
          Index Cond: (id = ANY (ARRAY[$1, ($1 + 1)]))
 (4 rows)
 
-SELECT * FROM reconsider_ps_modes(0, true); -- and try again, clear stat at the end.
+SELECT * FROM reconsider_ps_modes(); -- and try again, clear stat at the end.
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         0 |         6
@@ -272,7 +278,7 @@ EXECUTE qry2(110);
 
 -- qry1 - auto -> force generic plan mode (step 1.)
 -- qry2 stay as is
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           1 |         0 |         7
@@ -321,7 +327,7 @@ EXECUTE qry1(ARRAY[1,1]) \watch i=0 c=10
 
 \o
 -- Previous executions were stable enough. So, no change in decisions.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         0 |         8
@@ -365,7 +371,7 @@ EXECUTE qry2(10);
 EXECUTE qry2(280);
 \o
 -- change qry1 and qry2 plan cache modes to forced custom.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           0 |         2 |         6
@@ -411,7 +417,7 @@ EXECUTE qry1(ARRAY[1,3]); \watch i=0 c=3
 \o
 -- Query execution is stable enough: switch back to generic plan for qry2,
 --  don't change qry1 plan cache mode.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
  to_generic | to_custom | unchanged 
 ------------+-----------+-----------
           1 |         0 |         7

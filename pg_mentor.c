@@ -43,7 +43,7 @@ PG_FUNCTION_INFO_V1(pg_mentor_reload_conf);
 PG_FUNCTION_INFO_V1(pg_mentor_set_plan_mode);
 PG_FUNCTION_INFO_V1(pg_mentor_show_prepared_statements);
 PG_FUNCTION_INFO_V1(pg_mentor_reset);
-PG_FUNCTION_INFO_V1(reconsider_ps_modes1);
+PG_FUNCTION_INFO_V1(reconsider_ps_modes);
 
 static const char  *psfuncname = "pg_prepared_statement";
 static Oid			psfuncoid = 0;
@@ -491,7 +491,7 @@ calculateStandardDeviation(int N, int64 data[])
 }
 
 Datum
-reconsider_ps_modes1(PG_FUNCTION_ARGS)
+reconsider_ps_modes(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	dshash_seq_status	hash_seq;

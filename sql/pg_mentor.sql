@@ -63,6 +63,7 @@ EXECUTE stmt1(1); -- auto mode
 SELECT oid AS dboid FROM pg_database WHERE datname = current_database() \gset
 
 SELECT true FROM pg_stat_statements_reset(0, :dboid);
+SELECT pg_mentor_reset();
 
 -- Prepare the case when custom plan cost all the time much less than the
 -- generic one
@@ -97,7 +98,7 @@ EXECUTE qry(1); -- it uses custom plan yet
 SELECT * FROM reconsider_ps_modes();
 
 EXPLAIN (COSTS OFF) EXECUTE qry(1); -- should be generic plan
-SELECT * FROM reconsider_ps_modes(0, true); -- and try again, clear stat at the end.
+SELECT * FROM reconsider_ps_modes(); -- and try again, clear stat at the end.
 
 CREATE TABLE part3 AS SELECT 201::int AS id
 FROM generate_series(1,1E4) AS x;
@@ -140,7 +141,7 @@ EXECUTE qry2(110);
 
 -- qry1 - auto -> force generic plan mode (step 1.)
 -- qry2 stay as is
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
 
 -- Check: qry1 (generic), qry2 (custom).
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
@@ -157,7 +158,7 @@ EXECUTE qry1(ARRAY[1,1]) \watch i=0 c=10
 \o
 
 -- Previous executions were stable enough. So, no change in decisions.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,201]); --bad execution
@@ -173,7 +174,7 @@ EXECUTE qry2(280);
 \o
 
 -- change qry1 and qry2 plan cache modes to forced custom.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
 
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry1(ARRAY[1,3]);
@@ -191,7 +192,7 @@ EXECUTE qry1(ARRAY[1,3]); \watch i=0 c=3
 
 -- Query execution is stable enough: switch back to generic plan for qry2,
 --  don't change qry1 plan cache mode.
-SELECT * FROM reconsider_ps_modes1();
+SELECT * FROM reconsider_ps_modes();
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
 EXECUTE qry2(1); -- must be generic
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF, SUMMARY OFF)
