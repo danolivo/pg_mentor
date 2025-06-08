@@ -1198,6 +1198,8 @@ pgm_ExecutorEnd(QueryDesc *queryDesc)
 void
 _PG_init(void)
 {
+	EnableQueryId();
+
 	/* Cache oid for further direct calls */
 	psfuncoid = fmgr_internal_function(psfuncname);
 	Assert(psfuncoid != InvalidOid);
