@@ -698,7 +698,7 @@ pgm_planner(Query *parse, const char *query_string,
 	PlannedStmt *result;
 
 	if (pgm_enabled(nesting_level) && query_string
-		&& parse->queryId != INT64CONST(0) && IsTransactionState() &&
+		&& parse->queryId != INT64CONST(0) &&
 		get_extension_oid(MODULENAME, true))
 	{
 		instr_time	start;
