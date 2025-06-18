@@ -13,10 +13,8 @@
 
 #include "postgres.h"
 
-#include "access/parallel.h"
 #include "access/xact.h"
 #include "commands/extension.h"
-#include "commands/prepare.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "lib/dshash.h"
@@ -32,7 +30,7 @@
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 
-#define MODULENAME	"pg_mentor"
+#include "pg_mentor.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = MODULENAME,
@@ -48,9 +46,6 @@ PG_FUNCTION_INFO_V1(reconsider_ps_modes);
 static const char  *psfuncname = "pg_prepared_statement";
 static Oid			psfuncoid = 0;
 static int			nesting_level = 0;
-
-#define pgm_enabled(level) \
-	(!IsParallelWorker() && (level) == 0)
 
 /*
  * List of intercepted hooks.
@@ -111,9 +106,23 @@ typedef struct MentorTblEntry
 	double		plan_time;
 } MentorTblEntry;
 
+
+/*
+ * The prepared_queries hash table is private core entity. So let's manage the
+ * extension internal hash table. It can help us to cleanup global table on
+ * backend exit.
+ */
+typedef struct LocaLPSEntry
+{
+	uint64	queryId;
+	int32	refcounter;
+	double	plan_time;
+} LocaLPSEntry;
+
 static dsa_area *dsa = NULL;
 
-static dshash_parameters dsh_params = {
+static dshash_parameters dsh_params =
+{
 	sizeof(uint64),
 	sizeof(MentorTblEntry),
 	dshash_memcmp,
@@ -228,18 +237,6 @@ fetch_prepared_statements(void)
 
 	return pslst;
 }
-
-/*
- * The prepared_queries hash table is private core entity. So let's manage the
- * extension internal hash table. It can help us to cleanup global table on
- * backend exit.
- */
-typedef struct LocaLPSEntry
-{
-	uint64	queryId;
-	int32	refcounter;
-	double	plan_time;
-} LocaLPSEntry;
 
 /*
  * Does prepared statements table changed?
@@ -506,8 +503,6 @@ reconsider_ps_modes(PG_FUNCTION_ARGS)
 
 	pgm_init_shmem();
 
-//	InitMaterializedSRF(fcinfo, 0);
-
 	dshash_seq_init(&hash_seq, pgm_hash, false);
 	while ((entry = dshash_seq_next(&hash_seq)) != NULL)
 	{
@@ -764,7 +759,7 @@ pgm_planner(Query *parse, const char *query_string,
 	return result;
 }
 
-static uint64
+uint64
 get_prepared_stmt_queryId(PreparedStatement  *ps)
 {
 	ListCell		   *lc;
@@ -814,7 +809,7 @@ on_prepare(PreparedStatement *ps)
 	MentorTblEntry	   *entry;
 	LocaLPSEntry	   *lentry;
 	bool				found;
-	bool				found1;
+	bool				lfound;
 	uint32				refcounter;
 
 	if (queryId == UINT64CONST(0))
@@ -847,8 +842,8 @@ on_prepare(PreparedStatement *ps)
 
 	/* Don't forget to insert it locally */
 	lentry = (LocaLPSEntry *) hash_search(pgm_local_hash,
-										  &queryId, HASH_ENTER, &found1);
-	if (!found1)
+										  &queryId, HASH_ENTER, &lfound);
+	if (!lfound)
 	{
 		lentry->refcounter = 1;
 		lentry->plan_time = -1.;
@@ -857,7 +852,7 @@ on_prepare(PreparedStatement *ps)
 		lentry->refcounter++;
 
 	/* If the entry doesn't exist in global entry it can't be in the local one */
-	Assert(!(!found && found1));
+	Assert(!(!found && lfound));
 
 	/* Don't trust to big numbers */
 	Assert(refcounter < UINT32_MAX - 1);
@@ -890,6 +885,7 @@ on_deallocate(uint64 queryId)
 										  &queryId, HASH_FIND, &found);
 		le->refcounter--;
 		if (le->refcounter == 0)
+			/* Here, we also reset all metering statistics */
 			(void) hash_search(pgm_local_hash, &queryId, HASH_REMOVE, NULL);
 
 		if (found)
@@ -949,7 +945,8 @@ on_deallocate(uint64 queryId)
 }
 
 static void
-on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time)
+on_execute(uint64 queryId, BufferUsage *bufusage, double exec_time,
+		   LocaLPSEntry *lentry)
 {
 	MentorTblEntry	   *entry;
 	int64				nblocks;
@@ -1034,6 +1031,7 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 	uint64		queryId = UINT64CONST(0);
+	void	   *plansource_ptr;
 	bool		deallocate_all = false;
 
 	if (!IsTransactionState() || !get_extension_oid(MODULENAME, true))
@@ -1064,6 +1062,7 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 
 			queryId = (ps == NULL) ?	UINT64CONST(0) :
 										get_prepared_stmt_queryId(ps);
+			plansource_ptr = (ps == NULL) ? NULL : ps->plansource;
 		}
 		else
 			deallocate_all = true;
@@ -1087,12 +1086,16 @@ pgm_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
 			PreparedStatement  *ps = FetchPreparedStatement(stmt->name, true);
 
 			on_prepare(ps);
+			automode_on_prepare(ps);
 		}
 			break;
 		case T_DeallocateStmt:
 		{
 			if (queryId != UINT64CONST(0) || deallocate_all)
+			{
 				on_deallocate(queryId);
+				automode_on_deallocate(queryId, plansource_ptr);
+			}
 		}
 			break;
 		default:
@@ -1177,15 +1180,16 @@ pgm_ExecutorEnd(QueryDesc *queryDesc)
 		pgm_enabled(nesting_level) &&
 		((queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0))
 	{
-		bool	found;
+		LocaLPSEntry   *entry;
+		bool			found;
 
-		(void) hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
+		entry = hash_search(pgm_local_hash, &queryId, HASH_FIND, &found);
 		if (found)
 		{
 			InstrEndLoop(queryDesc->totaltime);
 
 			on_execute(queryId, &queryDesc->totaltime->bufusage,
-					   queryDesc->totaltime->total * 1000.0);
+					   queryDesc->totaltime->total * 1000.0, entry);
 		}
 	}
 
@@ -1220,6 +1224,8 @@ _PG_init(void)
 	ExecutorEnd_hook = pgm_ExecutorEnd;
 
 	recreate_local_htab();
+
+	automode_init();
 
 	MarkGUCPrefixReserved(MODULENAME);
 }

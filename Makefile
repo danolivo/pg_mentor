@@ -3,7 +3,7 @@
 MODULE_big	= pg_mentor
 OBJS = \
 	$(WIN32RES) \
-	pg_mentor.o
+	pg_mentor.o automode.o
 
 EXTENSION = pg_mentor
 DATA = pg_mentor--0.1.sql
