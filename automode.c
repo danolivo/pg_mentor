@@ -6,8 +6,6 @@
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "optimizer/planner.h"
-#include "storage/ipc.h"
-#include "tcop/utility.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/plancache.h"
@@ -25,7 +23,7 @@ typedef struct PSMeteringEntry
 	PSMeteringEntryKey key;
 
 	/* Should be set in hash table slot only */
-	List			   *plansources;
+	List   *plansources;
 
 	/*
 	 * Statistics needed for managing prepared statements in auto mode.
@@ -279,7 +277,7 @@ ps_need_reset(PSMeteringEntry *entry,
  * Decide if it is needed to reset current core solution
  */
 static void
-pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
+metering_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	uint64		queryId = queryDesc->plannedstmt->queryId;
 	PSMeteringEntryKey key = {.queryId = queryId};
@@ -345,7 +343,7 @@ pgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 }
 
 static void
-pgm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+metering_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
 	nesting_level++;
 	PG_TRY();
@@ -363,7 +361,7 @@ pgm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 }
 
 static void
-pgm_ExecutorFinish(QueryDesc *queryDesc)
+metering_ExecutorFinish(QueryDesc *queryDesc)
 {
 	nesting_level++;
 	PG_TRY();
@@ -381,7 +379,7 @@ pgm_ExecutorFinish(QueryDesc *queryDesc)
 }
 
 static void
-pgm_ExecutorEnd(QueryDesc *queryDesc)
+metering_ExecutorEnd(QueryDesc *queryDesc)
 {
 	uint64		queryId = queryDesc->plannedstmt->queryId;
 	PSMeteringEntryKey key = {.queryId = queryId};
@@ -490,11 +488,11 @@ automode_init()
 	prev_planner_hook = planner_hook;
 	planner_hook = metering_planner;
 	prev_ExecutorStart = ExecutorStart_hook;
-	ExecutorStart_hook = pgm_ExecutorStart;
+	ExecutorStart_hook = metering_ExecutorStart;
 	prev_ExecutorRun = ExecutorRun_hook;
-	ExecutorRun_hook = pgm_ExecutorRun;
+	ExecutorRun_hook = metering_ExecutorRun;
 	prev_ExecutorFinish = ExecutorFinish_hook;
-	ExecutorFinish_hook = pgm_ExecutorFinish;
+	ExecutorFinish_hook = metering_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
-	ExecutorEnd_hook = pgm_ExecutorEnd;
+	ExecutorEnd_hook = metering_ExecutorEnd;
 }
