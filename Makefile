@@ -5,6 +5,8 @@ OBJS = \
 	$(WIN32RES) \
 	pg_mentor.o
 
+REGRESS = automode
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

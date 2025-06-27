@@ -1,0 +1,15 @@
+
+LOAD 'pg_mentor';
+
+CREATE TABLE test_automode (
+  x integer,
+  y text DEFAULT 'some long enough text string'
+) WITH (autovacuum_enabled = off);
+
+INSERT INTO test_automode (SELECT x FROM generate_series(1,1E6) AS x);
+INSERT INTO test_automode (SELECT 1E6 + x%10 FROM generate_series(1,1E6) AS x);
+CREATE INDEX ON test_automode (x);
+VACUUM ANALYZE test_automode;
+
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF)
+SELECT * FROM test_automode WHERE x = 1 \watch i=10 c=0
