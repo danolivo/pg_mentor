@@ -3,7 +3,7 @@
 MODULE_big	= pg_mentor
 OBJS = \
 	$(WIN32RES) \
-	pg_mentor.o automode.o
+	pg_mentor.o
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
